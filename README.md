@@ -1,4 +1,4 @@
-# Cloud Chaser: Academic Pipeline Documentation
+# Cloud Chaser
 
 ## Abstract
 
