@@ -1,0 +1,4 @@
+[console_scripts]
+cloud-chaser-export = export:main
+cloud-chaser-infer = inference:main
+cloud-chaser-train = train:main

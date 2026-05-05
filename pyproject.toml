@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cloud-chaser"
+version = "0.1.0"
+description = "Two-stage cloud detection, segmentation, and meteorological classification."
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+  "albumentations>=1.4.0",
+  "numpy>=1.24",
+  "opencv-python>=4.8",
+  "pillow>=10.0",
+  "pyyaml>=6.0",
+  "scikit-learn>=1.3",
+  "torch>=2.1",
+  "torchvision>=0.16",
+  "tqdm>=4.66",
+  "ultralytics>=8.2.0",
+]
+
+[project.optional-dependencies]
+dev = ["ruff>=0.5", "pytest>=8.0"]
+
+[project.scripts]
+cloud-chaser-train = "train:main"
+cloud-chaser-infer = "inference:main"
+cloud-chaser-export = "export:main"
+
+[tool.setuptools.packages.find]
+include = ["cloud_chaser*"]
+
+[tool.setuptools]
+py-modules = ["train", "inference", "export"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

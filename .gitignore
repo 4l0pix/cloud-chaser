@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+data/
+runs/
+weights/
+*.pt
+*.pth
+*.onnx
+*.engine
+*.torchscript
