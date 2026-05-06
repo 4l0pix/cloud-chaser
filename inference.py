@@ -23,6 +23,7 @@ def main() -> None:
     identifier = CloudIdentifier(
         detector_weights=inf_cfg["detector_weights"],
         classifier_weights=inf_cfg["classifier_weights"],
+        class_names=data_cfg["classification_classes"],
         device=get_device(cfg),
         image_size=data_cfg["image_size"],
         detector_conf=det_cfg["conf"],

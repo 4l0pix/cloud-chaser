@@ -32,6 +32,7 @@ class CloudIdentifier:
         self,
         detector_weights: str | Path,
         classifier_weights: str | Path,
+        class_names: list[str] | None = None,
         device: str = "cuda",
         image_size: int = 224,
         detector_conf: float = 0.25,
@@ -47,16 +48,24 @@ class CloudIdentifier:
         self.detector_iou = detector_iou
         self.half = half and self.device != "cpu"
         self.crop_padding = crop_padding
-        checkpoint = load_checkpoint(classifier_weights, map_location=self.device)
-        self.classes = checkpoint["classes"]
         self.transform = eval_transforms(image_size)
-        self.classifier = CloudClassifier(
-            num_classes=len(self.classes),
-            backbone=checkpoint["backbone"],
-            dropout=0.0,
-            pretrained=False,
-        ).to(self.device)
-        self.classifier.load_state_dict(checkpoint["model"])
+
+        classifier_path = Path(classifier_weights)
+        if classifier_path.suffix in {".torchscript", ".ts"}:
+            if class_names is None:
+                raise ValueError("class_names are required when loading a TorchScript classifier.")
+            self.classes = class_names
+            self.classifier = torch.jit.load(str(classifier_path), map_location=self.device).to(self.device)
+        else:
+            checkpoint = load_checkpoint(classifier_path, map_location=self.device)
+            self.classes = checkpoint["classes"]
+            self.classifier = CloudClassifier(
+                num_classes=len(self.classes),
+                backbone=checkpoint["backbone"],
+                dropout=0.0,
+                pretrained=False,
+            ).to(self.device)
+            self.classifier.load_state_dict(checkpoint["model"])
         self.classifier.eval()
 
     def _crop_instances(
