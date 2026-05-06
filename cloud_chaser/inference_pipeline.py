@@ -89,7 +89,7 @@ class CloudIdentifier:
             crops.append(self.transform(image=crop)["image"])
         return crops
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def predict(self, image_path: str | Path) -> tuple[np.ndarray, list[CloudPrediction]]:
         image_bgr = cv2.imread(str(image_path))
         if image_bgr is None:
