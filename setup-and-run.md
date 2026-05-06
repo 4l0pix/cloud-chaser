@@ -2,7 +2,7 @@
 
 Production-oriented two-stage cloud identification:
 
-1. YOLO segmentation finds cloud/sky foreground in outdoor scenes.
+1. YOLO segmentation finds cloud foreground in sky/outdoor scenes.
 2. A PyTorch classifier assigns one of the seven GCD cloud classes to each detected crop.
 3. Inference overlays masks, boxes, and labels such as `1_cumulus - 94%`.
 
@@ -10,11 +10,11 @@ Production-oriented two-stage cloud identification:
 
 ```text
 cloud_chaser/
-  data/                 ADE20K, GCD, TJNU datasets and augmentations
+  data/                 SWIMSEG, GCD, TJNU datasets and augmentations
   models/               YOLO wrapper, classifier backbones, SimCLR
   utils/                checkpoints, metrics, visualization
   training.py           SSL, classifier, and detector training loops
-  evaluation.py         detector mask-mAP and ADE validation mIoU
+  evaluation.py         detector mask-mAP and SWIMSEG validation mIoU
 configs/default.yaml    centralized configuration
 train.py                training and evaluation CLI
 inference.py            end-to-end prediction CLI
@@ -68,23 +68,18 @@ sudo apt install python3.12 python3.12-venv python3.12-dev
 Expected local datasets:
 
 ```text
-data/ADE20K/images/training/*.jpg
-data/ADE20K/images/validation/*.jpg
-data/ADE20K/annotations/training/*.png
-data/ADE20K/annotations/validation/*.png
+data/swimseg-2/**                      # SWIMSEG/SkyImage image-mask pairs
 data/GCD/train/<class>/*.jpg
 data/GCD/test/<class>/*.jpg
 data/TJNU/**/*.jpg                 # optional, for SimCLR pretraining
 ```
 
-This ADE20K checkout exposes `sky` as class `3`; `cloud` is not present in `objectInfo150.txt`. The converter requests both and falls back to class ID `3`, controlled in `configs/default.yaml`.
-
 ## Training
 
-Prepare ADE20K as YOLO segmentation data:
+Prepare SWIMSEG as YOLO segmentation data:
 
 ```bash
-python3 -m scripts.prepare_ade20k_yolo --config configs/default.yaml
+python3 -m scripts.prepare_swimseg_yolo --config configs/default.yaml
 ```
 
 Train the segmentation model:
@@ -93,7 +88,7 @@ Train the segmentation model:
 python3 train.py detector --config configs/default.yaml
 ```
 
-Pretrain the classifier encoder with SimCLR on unlabeled TJNU:
+Optionally pretrain the classifier encoder with SimCLR on unlabeled TJNU. If TJNU is absent, this command skips cleanly:
 
 ```bash
 python3 train.py ssl --config configs/default.yaml
@@ -122,7 +117,7 @@ Then set `data.gcd_root: data/GCD_crops`.
 
 ## Evaluation
 
-Segmentation reports Ultralytics mask mAP plus foreground mIoU on ADE20K validation:
+Segmentation reports Ultralytics mask mAP plus foreground mIoU on SWIMSEG validation:
 
 ```bash
 python3 train.py eval-detector --config configs/default.yaml

@@ -2,7 +2,39 @@
 
 ## Abstract
 
-Cloud Chaser is a two-stage computer vision system for cloud identification in unconstrained outdoor imagery. The system first localizes cloud-like regions using an instance segmentation model trained on environmental scene annotations, then classifies each detected cloud region into a meteorological category using a deep convolutional classifier. The design separates geometric localization from cloud-type recognition, allowing the segmentation module to handle background clutter such as buildings, trees, mountains, and blue sky, while the classification module focuses on texture, shape, and spatial structure within extracted cloud regions.
+Cloud Chaser is a two-stage computer vision system for cloud identification in unconstrained outdoor imagery. The system first localizes cloud-like regions using an instance segmentation model trained on SWIMSEG cloud masks, then classifies each detected cloud region into a meteorological category using a deep convolutional classifier. The design separates geometric localization from cloud-type recognition, allowing the segmentation module to learn cloud boundaries while the classification module focuses on texture, shape, and spatial structure within extracted cloud regions.
+
+## Local Quick Start
+
+Expected local datasets:
+
+```text
+data/swimseg-2/**              # SWIMSEG/SkyImage image-mask pairs for cloud segmentation
+data/GCD/train/<class>/*.jpg   # 7-class cloud classifier data
+data/GCD/test/<class>/*.jpg
+data/TJNU/**/*.jpg             # optional SimCLR pretraining data
+```
+
+Prepare SWIMSEG masks for YOLO-Seg:
+
+```bash
+python -m scripts.prepare_swimseg_yolo --config configs/default.yaml
+```
+
+Train/evaluate the detector:
+
+```bash
+python train.py detector --config configs/default.yaml
+python train.py eval-detector --config configs/default.yaml
+```
+
+Train the classifier. If TJNU is missing, `train.py ssl` will skip cleanly and the classifier will use ImageNet-pretrained weights:
+
+```bash
+python train.py ssl --config configs/default.yaml
+python train.py classifier --config configs/default.yaml
+python train.py eval-classifier --config configs/default.yaml
+```
 
 ## 1. Problem Definition
 
@@ -18,11 +50,11 @@ The task is challenging because clouds have ambiguous boundaries, variable scale
 
 ## 2. Dataset Strategy
 
-### 2.1 Localization Dataset: ADE20K
+### 2.1 Localization Dataset: SWIMSEG / SkyImage
 
-ADE20K is used to train the segmentation component because it contains general-scene semantic annotations. Rather than training only on isolated sky imagery, ADE20K exposes the model to realistic environmental context, including urban, rural, coastal, mountainous, and indoor/outdoor transition scenes.
+SWIMSEG from the SkyImage dataset is used to train the segmentation component because it provides explicit cloud masks. This is a better segmentation target than generic scene labels: the detector learns cloud-vs-sky boundaries directly instead of relying on `sky` as a proxy foreground class.
 
-The pipeline extracts the relevant foreground classes, primarily `sky` and, when available, `cloud`. In this repository’s ADE20K metadata, `sky` is available as class ID `3`, while `cloud` is not present in the 150-class mapping. Therefore, the converter is configurable and falls back to `sky` when a dedicated cloud label is unavailable. This produces a one-class YOLO segmentation dataset where the foreground class is treated as cloud/sky-region candidate material.
+The local converter discovers image-mask pairs, binarizes the cloud masks, extracts connected components, converts them into YOLO-Seg polygons, and writes a one-class segmentation dataset where the foreground class is `cloud`.
 
 ### 2.2 Classification Dataset: GCD
 
@@ -44,9 +76,9 @@ The unlabeled TJNU dataset is used for self-supervised representation learning. 
 
 ## 3. Data Preprocessing and Augmentation
 
-### 3.1 ADE20K Mask Conversion
+### 3.1 SWIMSEG Mask Conversion
 
-ADE20K semantic masks are converted into YOLO segmentation labels. For each ADE mask, pixels belonging to the selected class IDs are combined into a binary foreground mask. Connected components are extracted, filtered by minimum area, converted into polygon contours, normalized to image coordinates, and written in YOLO segmentation format.
+SWIMSEG binary masks are converted into YOLO segmentation labels. For each mask, foreground cloud pixels are extracted, connected components are filtered by minimum area, converted into polygon contours, normalized to image coordinates, and written in YOLO segmentation format.
 
 This conversion enables fine-tuning YOLO-Seg models using pixel-level supervision while preserving instance-like connected regions.
 
@@ -75,7 +107,7 @@ YOLO-Seg is used because it provides:
 
 ### 4.2 Training Objective
 
-The detector is fine-tuned on the converted ADE20K masks. Its objective is to distinguish cloud/sky foreground from non-cloud background objects such as buildings, vegetation, roads, and mountains. The output consists of binary instance masks, bounding boxes, and confidence scores.
+The detector is fine-tuned on converted SWIMSEG cloud masks. Its objective is to identify cloud pixels and cloud-region boxes from sky imagery. The output consists of binary instance-like masks, bounding boxes, and confidence scores.
 
 ### 4.3 Output
 
@@ -161,9 +193,9 @@ The segmentation module is evaluated using:
 
 - mask mAP, reported by Ultralytics validation,
 - mask mAP@50,
-- mean Intersection over Union over ADE20K validation foreground masks.
+- mean Intersection over Union over SWIMSEG validation foreground masks.
 
-For binary mIoU, the predicted foreground mask is compared with the target cloud/sky mask:
+For binary mIoU, the predicted foreground mask is compared with the target cloud mask:
 
 \[
 \text{IoU} = \frac{|M_{pred} \cap M_{gt}|}{|M_{pred} \cup M_{gt}|}
@@ -184,10 +216,10 @@ The pipeline uses deterministic train/validation splitting for GCD and a central
 
 ## 10. Limitations
 
-The current ADE20K segmentation supervision depends on available semantic classes. If a dataset provides explicit cloud masks, those annotations should be preferred over generic sky masks. In the current ADE20K mapping, `cloud` is absent, so `sky` is used as a proxy for cloud-region awareness. This can cause the detector to include clear sky areas, which the classification stage partially addresses through the `Clear sky` class.
+The current SWIMSEG supervision is much more cloud-specific than ADE20K, but it is still primarily sky-image oriented. It may not cover every cluttered ground-level outdoor condition, such as clouds partly occluded by buildings, trees, cables, or mountains.
 
 The classification model also depends on the quality and representativeness of GCD labels. Ambiguous cloud scenes, transitional cloud forms, and multi-layer atmospheres may be difficult to assign to a single class.
 
 ## 11. Conclusion
 
-Cloud Chaser implements a practical two-stage approach for cloud identification in general outdoor imagery. By combining ADE20K-based environmental segmentation, self-supervised cloud representation learning, and supervised GCD classification, the system balances localization robustness with meteorological specificity. The resulting pipeline is suitable for experimentation, deployment-oriented optimization, and further research into cloud-type recognition under real-world visual conditions.
+Cloud Chaser implements a practical two-stage approach for cloud identification in general outdoor imagery. By combining SWIMSEG-based cloud-mask segmentation, optional self-supervised cloud representation learning, and supervised GCD classification, the system balances localization robustness with meteorological specificity. The resulting pipeline is suitable for experimentation, deployment-oriented optimization, and further research into cloud-type recognition under real-world visual conditions.

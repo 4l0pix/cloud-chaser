@@ -5,13 +5,15 @@ project:
   output_dir: runs
 
 data:
-  ade20k_root: data/ADE20K
+  swimseg_root: data/swimseg-2
   gcd_root: data/GCD
   tjnu_root: data/TJNU
-  prepared_seg_dir: data/processed/ade20k_cloud_yolo
+  prepared_seg_dir: data/processed/swimseg_cloud_yolo
   num_workers: 8
   image_size: 224
   val_fraction: 0.15
+  seg_val_fraction: 0.10
+  seg_test_fraction: 0.10
   classification_classes:
     - 1_cumulus
     - 2_altocumulus
@@ -20,12 +22,8 @@ data:
     - 5_stratocumulus
     - 6_cumulonimbus
     - 7_mixed
-  ade_classes:
-    - cloud
-    - sky
-  ade_fallback_class_ids:
-    - 3
-  min_mask_area: 512
+  min_mask_area: 96
+  swimseg_invert_masks: false
 
 augmentation:
   random_shadow_p: 0.25
@@ -35,7 +33,7 @@ augmentation:
 
 detector:
   model: yolo11s-seg.pt
-  epochs: 80
+  epochs: 30
   imgsz: 640
   batch: 8
   patience: 20

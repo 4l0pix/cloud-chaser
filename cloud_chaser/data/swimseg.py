@@ -1,0 +1,228 @@
+from __future__ import annotations
+
+import csv
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+import cv2
+import numpy as np
+from PIL import Image
+from sklearn.model_selection import train_test_split
+from tqdm import tqdm
+
+from cloud_chaser.config import save_yaml
+from cloud_chaser.data.gcd import IMAGE_EXTENSIONS
+
+MASK_TOKENS = (
+    "mask",
+    "masks",
+    "gt",
+    "gtmaps",
+    "groundtruth",
+    "ground_truth",
+    "truth",
+    "label",
+    "labels",
+    "annotation",
+    "annotations",
+    "segmentation",
+    "binary",
+)
+
+
+@dataclass(frozen=True)
+class SwimsegPair:
+    image_path: Path
+    mask_path: Path
+
+
+def _is_probable_binary_mask(path: Path) -> bool:
+    image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        return False
+    sample = image[:: max(1, image.shape[0] // 256), :: max(1, image.shape[1] // 256)]
+    unique = np.unique(sample)
+    if len(unique) <= 8:
+        return True
+    low_high = ((sample < 16) | (sample > 239)).mean()
+    return bool(low_high > 0.97)
+
+
+def _looks_like_mask_path(path: Path) -> bool:
+    joined = "/".join(part.lower() for part in path.parts)
+    return any(token in joined for token in MASK_TOKENS) or _is_probable_binary_mask(path)
+
+
+def _normal_stem(path: Path) -> str:
+    stem = path.stem.lower()
+    stem = re.sub(
+        r"(_|-)?(mask|gt|gtmap|groundtruth|ground_truth|truth|label|annotation|segmentation|binary)$",
+        "",
+        stem,
+    )
+    return re.sub(r"[^a-z0-9]+", "", stem)
+
+
+def discover_swimseg_pairs(root: str | Path) -> list[SwimsegPair]:
+    root = Path(root)
+    if not root.exists():
+        raise FileNotFoundError(f"SWIMSEG root does not exist: {root}")
+
+    files = sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS)
+    if not files:
+        raise RuntimeError(f"No image files found under {root}")
+
+    mask_set = {p for p in files if _looks_like_mask_path(p)}
+    mask_files = sorted(mask_set)
+    image_files = sorted(p for p in files if p not in mask_set)
+
+    if not image_files or not mask_files:
+        mask_set = {p for p in files if _is_probable_binary_mask(p)}
+        mask_files = sorted(mask_set)
+        image_files = sorted(p for p in files if p not in mask_set)
+
+    masks_by_key: dict[str, list[Path]] = {}
+    for mask in mask_files:
+        masks_by_key.setdefault(_normal_stem(mask), []).append(mask)
+
+    pairs: list[SwimsegPair] = []
+    used_masks: set[Path] = set()
+    for image in image_files:
+        candidates = [m for m in masks_by_key.get(_normal_stem(image), []) if m not in used_masks]
+        if candidates:
+            mask = candidates[0]
+            pairs.append(SwimsegPair(image, mask))
+            used_masks.add(mask)
+
+    # Some packaged SWIMSEG variants keep images and masks aligned by sorted order.
+    if len(pairs) < min(len(image_files), len(mask_files)) * 0.5:
+        pairs = []
+        for image, mask in zip(sorted(image_files), sorted(mask_files), strict=False):
+            img = cv2.imread(str(image), cv2.IMREAD_COLOR)
+            msk = cv2.imread(str(mask), cv2.IMREAD_GRAYSCALE)
+            if img is not None and msk is not None and img.shape[:2] == msk.shape[:2]:
+                pairs.append(SwimsegPair(image, mask))
+
+    if not pairs:
+        raise RuntimeError(
+            f"Could not pair SWIMSEG images and masks under {root}. "
+            "Inspect the dataset tree and update data.swimseg_root."
+        )
+    print(f"Discovered {len(pairs)} SWIMSEG image/mask pairs under {root}")
+    return pairs
+
+
+def _mask_to_yolo_polygons(mask: np.ndarray, min_area: int) -> list[list[float]]:
+    mask = mask.astype(np.uint8)
+    num_labels, labels = cv2.connectedComponents(mask, connectivity=8)
+    h, w = mask.shape[:2]
+    polygons: list[list[float]] = []
+    for component_id in range(1, num_labels):
+        component = (labels == component_id).astype(np.uint8)
+        if int(component.sum()) < min_area:
+            continue
+        contours, _ = cv2.findContours(component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            if cv2.contourArea(contour) < min_area or len(contour) < 3:
+                continue
+            epsilon = 0.0025 * cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, epsilon, True).reshape(-1, 2)
+            if len(approx) < 3:
+                continue
+            coords: list[float] = []
+            for x, y in approx:
+                coords.extend([float(np.clip(x / w, 0, 1)), float(np.clip(y / h, 0, 1))])
+            if len(coords) >= 6:
+                polygons.append(coords)
+    return polygons
+
+
+def _binary_cloud_mask(mask_path: Path, invert: bool = False) -> np.ndarray:
+    mask = np.array(Image.open(mask_path).convert("L"))
+    binary = mask > 127
+    if invert:
+        binary = ~binary
+    return binary.astype(np.uint8)
+
+
+def _safe_link_or_copy(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        return
+    try:
+        target.symlink_to(source.resolve())
+    except OSError:
+        image = cv2.imread(str(source), cv2.IMREAD_UNCHANGED)
+        if image is None:
+            raise FileNotFoundError(source)
+        cv2.imwrite(str(target), image)
+
+
+def prepare_swimseg_yolo(
+    root: str | Path,
+    output_dir: str | Path,
+    val_fraction: float = 0.1,
+    test_fraction: float = 0.1,
+    seed: int = 42,
+    min_mask_area: int = 96,
+    invert_masks: bool = False,
+) -> Path:
+    output_dir = Path(output_dir)
+    pairs = discover_swimseg_pairs(root)
+    indices = list(range(len(pairs)))
+    train_idx, holdout_idx = train_test_split(
+        indices,
+        test_size=val_fraction + test_fraction,
+        random_state=seed,
+    )
+    relative_test = test_fraction / max(val_fraction + test_fraction, 1e-9)
+    val_idx, test_idx = train_test_split(holdout_idx, test_size=relative_test, random_state=seed)
+    split_indices = {"train": train_idx, "val": val_idx, "test": test_idx}
+
+    manifest_path = output_dir / "manifest.csv"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    with manifest_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["split", "image", "mask"])
+        writer.writeheader()
+        for split, split_idx in split_indices.items():
+            for idx in tqdm(split_idx, desc=f"Preparing SWIMSEG {split}"):
+                pair = pairs[idx]
+                image = cv2.imread(str(pair.image_path), cv2.IMREAD_COLOR)
+                if image is None:
+                    continue
+                h, w = image.shape[:2]
+                binary = _binary_cloud_mask(pair.mask_path, invert=invert_masks)
+                if binary.shape != (h, w):
+                    binary = cv2.resize(binary, (w, h), interpolation=cv2.INTER_NEAREST)
+                polygons = _mask_to_yolo_polygons(binary, min_area=min_mask_area)
+                if not polygons:
+                    continue
+
+                target_image = output_dir / "images" / split / pair.image_path.name
+                target_mask = output_dir / "masks" / split / f"{pair.image_path.stem}.png"
+                label_path = output_dir / "labels" / split / f"{pair.image_path.stem}.txt"
+                _safe_link_or_copy(pair.image_path, target_image)
+                target_mask.parent.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(str(target_mask), binary * 255)
+                label_path.parent.mkdir(parents=True, exist_ok=True)
+                label_path.write_text(
+                    "\n".join("0 " + " ".join(f"{v:.6f}" for v in poly) for poly in polygons) + "\n",
+                    encoding="utf-8",
+                )
+                writer.writerow({"split": split, "image": str(target_image), "mask": str(target_mask)})
+
+    data_yaml = {
+        "path": str(output_dir.resolve()),
+        "train": "images/train",
+        "val": "images/val",
+        "test": "images/test",
+        "names": {0: "cloud"},
+        "metadata": {
+            "source": "SWIMSEG cloud-mask dataset",
+            "binary_mask_cloud_value": "white unless swimseg_invert_masks=true",
+            "pairs_discovered": len(pairs),
+        },
+    }
+    save_yaml(data_yaml, output_dir / "cloud_seg.yaml")
+    return output_dir / "cloud_seg.yaml"

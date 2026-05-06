@@ -8,13 +8,13 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from cloud_chaser.config import get_device
-from cloud_chaser.data.ade20k import prepare_ade20k_yolo
 from cloud_chaser.data.augmentations import (
     classification_train_transforms,
     eval_transforms,
     ssl_transforms,
 )
 from cloud_chaser.data.gcd import GCDDataset
+from cloud_chaser.data.swimseg import prepare_swimseg_yolo
 from cloud_chaser.data.tjnu import UnlabeledCloudDataset
 from cloud_chaser.models.classifier import CloudClassifier
 from cloud_chaser.models.detector import train_yolo_segmenter
@@ -28,12 +28,14 @@ def train_detector(cfg: dict) -> None:
     seed_everything(cfg["project"]["seed"])
     data_cfg = cfg["data"]
     detector_cfg = cfg["detector"]
-    data_yaml = prepare_ade20k_yolo(
-        root=data_cfg["ade20k_root"],
+    data_yaml = prepare_swimseg_yolo(
+        root=data_cfg["swimseg_root"],
         output_dir=data_cfg["prepared_seg_dir"],
-        class_names=data_cfg["ade_classes"],
-        fallback_class_ids=data_cfg.get("ade_fallback_class_ids", []),
-        min_mask_area=data_cfg["min_mask_area"],
+        val_fraction=data_cfg.get("seg_val_fraction", 0.1),
+        test_fraction=data_cfg.get("seg_test_fraction", 0.1),
+        seed=cfg["project"]["seed"],
+        min_mask_area=data_cfg.get("min_mask_area", 96),
+        invert_masks=data_cfg.get("swimseg_invert_masks", False),
     )
     output_dir = Path(cfg["project"]["output_dir"]) / "detector"
     train_yolo_segmenter(
@@ -55,8 +57,13 @@ def train_ssl(cfg: dict) -> None:
     device = get_device(cfg)
     data_cfg = cfg["data"]
     ssl_cfg = cfg["ssl"]
+    tjnu_root = Path(data_cfg["tjnu_root"])
+    if not tjnu_root.exists():
+        print(f"Skipping optional SimCLR pretraining: TJNU dataset not found at {tjnu_root}")
+        print("Classifier training can continue from an ImageNet-pretrained backbone instead.")
+        return
     dataset = UnlabeledCloudDataset(
-        data_cfg["tjnu_root"],
+        tjnu_root,
         ssl_transforms(data_cfg["image_size"], cfg["augmentation"]),
     )
     loader = DataLoader(
