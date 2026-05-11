@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 from pathlib import Path
 
 import torch
@@ -36,6 +37,9 @@ def export_classifier(cfg: dict, fmt: str, output: str | None = None) -> Path:
         traced = torch.jit.trace(model, dummy)
         traced.save(str(output_path))
     elif fmt == "onnx":
+        if importlib.util.find_spec("onnxscript") is None:
+            print("Skipping classifier ONNX export: onnxscript is not installed.")
+            return output_path
         torch.onnx.export(
             model,
             dummy,

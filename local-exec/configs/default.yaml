@@ -2,13 +2,12 @@ project:
   name: cloud-chaser
   seed: 42
   device: cuda
-  output_dir: runs
+  output_dir: ../results
 
 data:
-  swimseg_root: data/swimseg-2
-  gcd_root: data/GCD
-  tjnu_root: data/TJNU
-  prepared_seg_dir: data/processed/swimseg_cloud_yolo
+  swimseg_root: ../data/swimseg-2
+  gcd_root: ../data/GCD
+  prepared_seg_dir: ../data/processed/swimseg_cloud_yolo
   num_workers: 8
   image_size: 224
   val_fraction: 0.15
@@ -32,43 +31,41 @@ augmentation:
   vflip_p: 0.15
 
 detector:
-  model: yolo11s-seg.pt
-  epochs: 30
+  backend: hybrid
+  model: ../models/yolo11s-seg.pt
+  epochs: 120
   imgsz: 640
   batch: 8
-  patience: 20
+  patience: 35
   lr0: 0.01
   weight_decay: 0.0005
   conf: 0.25
   iou: 0.60
   half: true
 
-ssl:
-  method: simclr
-  backbone: resnet50
-  projection_dim: 128
-  hidden_dim: 2048
-  batch_size: 64
-  epochs: 100
+unet:
+  checkpoint: ../results/unet/best.pt
+  epochs: 60
+  batch_size: 8
   lr: 0.0003
-  weight_decay: 0.000001
-  temperature: 0.2
+  weight_decay: 0.00001
+  threshold: 0.45
+  min_area: 256
 
 classifier:
   backbone: resnet50
   batch_size: 32
-  epochs: 40
+  epochs: 80
   lr: 0.0001
   weight_decay: 0.0001
   dropout: 0.2
   amp: true
   freeze_backbone_epochs: 2
-  ssl_checkpoint: null
-  checkpoint: runs/classifier/best.pt
+  checkpoint: ../results/classifier/best.pt
 
 inference:
-  detector_weights: runs/detector/weights/best.pt
-  classifier_weights: runs/classifier/best.pt
-  output_dir: runs/inference
+  detector_weights: ../results/detector/weights/best.pt
+  classifier_weights: ../results/classifier/best.pt
+  output_dir: ../results/inference
   crop_padding: 12
   mask_alpha: 0.42

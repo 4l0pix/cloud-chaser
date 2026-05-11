@@ -1,225 +1,171 @@
 # Cloud Chaser
 
-## Abstract
+Cloud Chaser is a hybrid cloud detection and cloud-type classification pipeline. It detects cloud regions with a YOLO-Seg primary detector and a U-Net fallback detector, then classifies the detected RGB crop into one of the seven GCD cloud categories.
 
-Cloud Chaser is a two-stage computer vision system for cloud identification in unconstrained outdoor imagery. The system first localizes cloud-like regions using an instance segmentation model trained on SWIMSEG cloud masks, then classifies each detected cloud region into a meteorological category using a deep convolutional classifier. The design separates geometric localization from cloud-type recognition, allowing the segmentation module to learn cloud boundaries while the classification module focuses on texture, shape, and spatial structure within extracted cloud regions.
+The current best pipeline is:
+
+```text
+image
+  -> YOLO-Seg cloud detector
+  -> if YOLO finds no cloud, U-Net fallback detector
+  -> RGB bounding-box crop from the original image
+  -> GCD cloud-type classifier
+  -> mask/box/class overlay and cascade metrics
+```
+
+The detector mask is used for localization and visualization only. The classifier receives the normal RGB crop from the original image, not a blacked-out mask crop.
+
+## Repository Layout
+
+```text
+kaggle/       Kaggle notebook and Kaggle-specific workflow files
+local-exec/   Local Python package, CLI scripts, configs, and training code
+docs/         Documentation, notes, and papers
+venv/         Suggested local virtual environment location
+requirements.txt
+data/         Local datasets, ignored by git
+models/       Local pretrained/downloaded weights, ignored by git except docs
+README.md
+results/      Local training/evaluation/inference outputs, ignored by git except docs
+```
+
+## Architecture
+
+### 1. Hybrid Detection
+
+The detector stage has two backends:
+
+- **YOLO-Seg primary detector**: fast instance segmentation, trained from `yolo11s-seg.pt` on SWIMSEG cloud masks converted to YOLO polygon labels.
+- **U-Net fallback detector**: dense semantic segmentation trained on the same SWIMSEG binary masks. It runs when YOLO returns no detections.
+
+YOLO returns masks, boxes, and detector confidences directly. U-Net returns a cloud probability map; the pipeline thresholds it, removes small components, extracts connected components, and converts those components into masks, boxes, and confidence scores.
+
+### 2. Classification
+
+The classifier is a PyTorch CNN, currently ResNet50 by default, trained on the seven GCD classes:
+
+```text
+1_cumulus
+2_altocumulus
+3_cirrus
+4_clearsky
+5_stratocumulus
+6_cumulonimbus
+7_mixed
+```
+
+The classifier input is the RGB crop inside the detector bounding box. The detector mask is not applied to classifier pixels.
+
+### 3. Cascade Evaluation
+
+GCD has image-level class labels but no cloud masks, so final validation uses image-level cascade metrics:
+
+- **detector image accuracy**: cloudy classes should produce at least one detection; clear-sky images should produce none.
+- **classifier accuracy given detection**: classification accuracy only among images where a cloud was detected.
+- **cascade accuracy**: end-to-end success after both detection and classification.
+
+The report outputs are:
+
+```text
+results/reports/gcd_val_cascade_bar.png
+results/reports/gcd_val_cascade_overlay_samples.jpg
+results/reports/gcd_val_cascade_metrics.json
+```
+
+On Kaggle, the equivalent paths are:
+
+```text
+/kaggle/working/reports/gcd_val_cascade_bar.png
+/kaggle/working/reports/gcd_val_cascade_overlay_samples.jpg
+/kaggle/working/reports/gcd_val_cascade_metrics.json
+```
 
 ## Local Quick Start
 
-Expected local datasets:
+Create a virtual environment:
+
+```bash
+python3.12 -m venv venv
+source venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip install -e local-exec
+```
+
+Expected local data layout:
 
 ```text
-data/swimseg-2/**              # SWIMSEG/SkyImage image-mask pairs for cloud segmentation
-data/GCD/train/<class>/*.jpg   # 7-class cloud classifier data
+data/swimseg-2/**              # SWIMSEG/SkyImage image-mask pairs
+data/GCD/train/<class>/*.jpg
 data/GCD/test/<class>/*.jpg
-data/TJNU/**/*.jpg             # optional SimCLR pretraining data
 ```
 
-Prepare SWIMSEG masks for YOLO-Seg:
+Run local training from `local-exec/`:
 
 ```bash
+cd local-exec
 python -m scripts.prepare_swimseg_yolo --config configs/default.yaml
-```
-
-Train/evaluate the detector:
-
-```bash
 python train.py detector --config configs/default.yaml
-python train.py eval-detector --config configs/default.yaml
+python train.py unet --config configs/default.yaml
+python train.py classifier --config configs/default.yaml
 ```
 
-Train the classifier. If TJNU is missing, `train.py ssl` will skip cleanly and the classifier will use ImageNet-pretrained weights:
+Evaluate:
 
 ```bash
-python train.py ssl --config configs/default.yaml
-python train.py classifier --config configs/default.yaml
+python train.py eval-detector --config configs/default.yaml
+python train.py eval-unet --config configs/default.yaml
 python train.py eval-classifier --config configs/default.yaml
+python scripts/gcd_visual_report.py --config configs/default.yaml --output-dir ../results/reports
 ```
 
-## 1. Problem Definition
+Run inference:
 
-The objective is to process a raw outdoor image and produce pixel-level cloud masks, bounding boxes, confidence scores, and meteorological cloud-type labels. Formally, given an image \(I \in \mathbb{R}^{H \times W \times 3}\), the system predicts a set of cloud instances:
+```bash
+python inference.py \
+  --config configs/default.yaml \
+  --image ../data/example.jpg \
+  --output ../results/prediction.jpg
+```
 
-\[
-\mathcal{P} = \{(M_i, B_i, c_i, s_i, p_i)\}_{i=1}^{N}
-\]
+## Kaggle Workflow
 
-where \(M_i\) is a binary segmentation mask, \(B_i\) is a bounding box, \(c_i\) is the predicted cloud type, \(s_i\) is the segmentation confidence, and \(p_i\) is the classification confidence.
+Use:
 
-The task is challenging because clouds have ambiguous boundaries, variable scale, high intra-class diversity, and frequent visual overlap with sky, haze, smoke, snow, bright buildings, and other outdoor structures.
+```text
+kaggle/cloud_chaser_kaggle.ipynb
+```
 
-## 2. Dataset Strategy
+The notebook writes its own working copy to Kaggle, restores checkpoints from the attached `latest-output` dataset when present, resumes training from `last.pt` or `best.pt`, and writes simple outputs to:
 
-### 2.1 Localization Dataset: SWIMSEG / SkyImage
+```text
+/kaggle/working/runs
+/kaggle/working/reports
+/kaggle/working/checkpoints
+/kaggle/working/artifacts
+/kaggle/working/prediction.jpg
+```
 
-SWIMSEG from the SkyImage dataset is used to train the segmentation component because it provides explicit cloud masks. This is a better segmentation target than generic scene labels: the detector learns cloud-vs-sky boundaries directly instead of relying on `sky` as a proxy foreground class.
+## Checkpoints
 
-The local converter discovers image-mask pairs, binarizes the cloud masks, extracts connected components, converts them into YOLO-Seg polygons, and writes a one-class segmentation dataset where the foreground class is `cloud`.
+Local checkpoints are written under:
 
-### 2.2 Classification Dataset: GCD
+```text
+results/detector/weights/
+results/unet/
+results/classifier/
+```
 
-The GCD dataset provides labeled images for seven cloud categories:
+The training code resumes in this order:
 
-1. Cumulus
-2. Altocumulus
-3. Cirrus
-4. Clear sky
-5. Stratocumulus
-6. Cumulonimbus
-7. Mixed cloud
+```text
+last.pt -> best.pt -> start fresh
+```
 
-The classifier is trained using standard train, validation, and test partitions. If no validation directory exists, a stratified validation subset is deterministically sampled from the training set.
+For longer experiments, increase the target total epoch counts in:
 
-### 2.3 Self-Supervised Dataset: TJNU
+```text
+local-exec/configs/default.yaml
+```
 
-The unlabeled TJNU dataset is used for self-supervised representation learning. Since cloud morphology is strongly defined by texture, density, illumination, and spatial structure, self-supervised pretraining helps the encoder learn useful visual embeddings before supervised fine-tuning on the smaller labeled GCD set.
-
-## 3. Data Preprocessing and Augmentation
-
-### 3.1 SWIMSEG Mask Conversion
-
-SWIMSEG binary masks are converted into YOLO segmentation labels. For each mask, foreground cloud pixels are extracted, connected components are filtered by minimum area, converted into polygon contours, normalized to image coordinates, and written in YOLO segmentation format.
-
-This conversion enables fine-tuning YOLO-Seg models using pixel-level supervision while preserving instance-like connected regions.
-
-### 3.2 Meteorology-Aware Augmentations
-
-The classification and self-supervised pipelines use augmentations selected to preserve meteorological texture patterns while improving robustness:
-
-- Random shadows simulate illumination changes and partial occlusions.
-- Gaussian blur models atmospheric haze, lens softness, and motion blur.
-- Horizontal flips preserve cloud texture statistics and increase viewpoint diversity.
-- Conservative vertical flips are included because cloud texture is often orientation-tolerant, but the probability is kept lower than horizontal flips to avoid excessive physical distortion.
-- Color jitter accounts for exposure, white balance, and time-of-day variation.
-
-## 4. Segmentation Module
-
-### 4.1 Architecture
-
-The segmentation module uses an Ultralytics YOLO segmentation architecture, configured by default as `yolo11s-seg.pt`. The model may also be switched to `yolov8s-seg.pt` through the YAML configuration.
-
-YOLO-Seg is used because it provides:
-
-- real-time or near-real-time detection speed,
-- bounding boxes and masks from a single model,
-- strong transfer learning from pretrained weights,
-- straightforward export to ONNX and other deployment formats.
-
-### 4.2 Training Objective
-
-The detector is fine-tuned on converted SWIMSEG cloud masks. Its objective is to identify cloud pixels and cloud-region boxes from sky imagery. The output consists of binary instance-like masks, bounding boxes, and confidence scores.
-
-### 4.3 Output
-
-For each detected instance, the detector returns:
-
-- a bounding box \(B_i = (x_1, y_1, x_2, y_2)\),
-- a pixel mask \(M_i\),
-- a detection confidence \(s_i\).
-
-These outputs are passed to the classification stage.
-
-## 5. Feature Extraction and Classification Module
-
-### 5.1 Two-Stage Recognition
-
-The system uses a two-stage recognition strategy:
-
-1. Localize candidate cloud regions with YOLO-Seg.
-2. Classify each detected cloud crop using a CNN classifier.
-
-This design is preferred over whole-image classification because a general outdoor image may contain many irrelevant objects. Mask-guided cropping reduces background bias and encourages the classifier to focus on cloud morphology.
-
-### 5.2 Backbone Choices
-
-The classifier supports the following convolutional backbones:
-
-- ResNet50
-- EfficientNet-B0
-- DenseNet121
-
-ResNet50 is the default because it offers a strong balance between representational capacity, training stability, and deployment compatibility.
-
-### 5.3 Self-Supervised Pretraining
-
-The implemented self-supervised method is SimCLR. Given an unlabeled cloud image, two augmented views are generated and passed through a shared encoder and projection head. The NT-Xent contrastive loss pulls embeddings from the same image together while pushing embeddings from different images apart.
-
-This produces a cloud-aware encoder that can learn visual cues such as:
-
-- fibrous cirrus texture,
-- dense cumulonimbus vertical structure,
-- stratocumulus layering,
-- isolated cumulus contours,
-- mixed cloud heterogeneity.
-
-After pretraining, the encoder weights are transferred into the supervised classifier and fine-tuned on GCD labels.
-
-### 5.4 Supervised Fine-Tuning
-
-The classification head is trained with cross-entropy loss over the seven GCD classes. The training pipeline supports optional backbone freezing for early epochs, which stabilizes fine-tuning when the classifier is initialized from self-supervised weights.
-
-## 6. Inference Pipeline
-
-At inference time, the system processes a high-resolution image through the following steps:
-
-1. Read the raw RGB image.
-2. Run YOLO-Seg to detect cloud instances.
-3. Resize masks to the original image resolution when necessary.
-4. Use each mask and bounding box to extract a cloud-focused crop.
-5. Batch all crops and pass them through the classifier.
-6. Convert logits into class probabilities using softmax.
-7. Overlay masks, bounding boxes, class names, and confidence scores on the original image.
-
-The final output is an annotated image and a structured list of predictions.
-
-## 7. Optimization and Deployment
-
-The implementation supports several production-oriented optimizations:
-
-- mixed precision training and inference on CUDA,
-- batched classification of detected crops,
-- configurable YOLO confidence and IoU thresholds,
-- ONNX export for detector and classifier,
-- TorchScript export for classifier deployment,
-- centralized YAML configuration for reproducible experiments.
-
-The modular code structure separates data processing, model definitions, training logic, evaluation, inference, visualization, and export.
-
-## 8. Evaluation Metrics
-
-### 8.1 Segmentation Metrics
-
-The segmentation module is evaluated using:
-
-- mask mAP, reported by Ultralytics validation,
-- mask mAP@50,
-- mean Intersection over Union over SWIMSEG validation foreground masks.
-
-For binary mIoU, the predicted foreground mask is compared with the target cloud mask:
-
-\[
-\text{IoU} = \frac{|M_{pred} \cap M_{gt}|}{|M_{pred} \cup M_{gt}|}
-\]
-
-### 8.2 Classification Metrics
-
-The classifier is evaluated using:
-
-- Top-1 accuracy,
-- macro F1-score.
-
-Macro F1 is important because cloud datasets may be class-imbalanced, and average accuracy alone can obscure weak performance on rarer cloud types such as cumulonimbus.
-
-## 9. Reproducibility
-
-The pipeline uses deterministic train/validation splitting for GCD and a centralized configuration file. Important experimental parameters are stored in `configs/default.yaml`, including dataset roots, image size, model backbones, learning rates, batch sizes, epoch counts, augmentation probabilities, detector thresholds, and checkpoint paths.
-
-## 10. Limitations
-
-The current SWIMSEG supervision is much more cloud-specific than ADE20K, but it is still primarily sky-image oriented. It may not cover every cluttered ground-level outdoor condition, such as clouds partly occluded by buildings, trees, cables, or mountains.
-
-The classification model also depends on the quality and representativeness of GCD labels. Ambiguous cloud scenes, transitional cloud forms, and multi-layer atmospheres may be difficult to assign to a single class.
-
-## 11. Conclusion
-
-Cloud Chaser implements a practical two-stage approach for cloud identification in general outdoor imagery. By combining SWIMSEG-based cloud-mask segmentation, optional self-supervised cloud representation learning, and supervised GCD classification, the system balances localization robustness with meteorological specificity. The resulting pipeline is suitable for experimentation, deployment-oriented optimization, and further research into cloud-type recognition under real-world visual conditions.
+The epoch value is a total target, not an additive number. For example, if the classifier has reached epoch 40 and `epochs: 80`, the next run continues toward epoch 80.

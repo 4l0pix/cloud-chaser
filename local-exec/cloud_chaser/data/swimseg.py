@@ -9,9 +9,12 @@ import cv2
 import numpy as np
 from PIL import Image
 from sklearn.model_selection import train_test_split
+import torch
+from torch.utils.data import Dataset
 from tqdm import tqdm
 
 from cloud_chaser.config import save_yaml
+from cloud_chaser.data.augmentations import IMAGENET_MEAN, IMAGENET_STD
 from cloud_chaser.data.gcd import IMAGE_EXTENSIONS
 
 MASK_TOKENS = (
@@ -144,6 +147,48 @@ def _binary_cloud_mask(mask_path: Path, invert: bool = False) -> np.ndarray:
     if invert:
         binary = ~binary
     return binary.astype(np.uint8)
+
+
+class SwimsegMaskDataset(Dataset):
+    def __init__(
+        self,
+        prepared_dir: str | Path,
+        split: str,
+        image_size: int,
+    ) -> None:
+        self.prepared_dir = Path(prepared_dir)
+        self.split = split
+        self.image_size = image_size
+        manifest = self.prepared_dir / "manifest.csv"
+        if not manifest.exists():
+            raise FileNotFoundError(f"SWIMSEG manifest not found: {manifest}")
+        self.records: list[tuple[Path, Path]] = []
+        with manifest.open("r", newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if row["split"] == split:
+                    self.records.append((Path(row["image"]), Path(row["mask"])))
+        if not self.records:
+            raise RuntimeError(f"No SWIMSEG records found for split={split} in {manifest}")
+        self.mean = np.array(IMAGENET_MEAN, dtype=np.float32)
+        self.std = np.array(IMAGENET_STD, dtype=np.float32)
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        image_path, mask_path = self.records[index]
+        image = cv2.cvtColor(cv2.imread(str(image_path), cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
+        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        if image is None or mask is None:
+            raise FileNotFoundError(f"Could not read SWIMSEG pair: {image_path}, {mask_path}")
+        image = cv2.resize(image, (self.image_size, self.image_size), interpolation=cv2.INTER_AREA)
+        mask = cv2.resize(mask, (self.image_size, self.image_size), interpolation=cv2.INTER_NEAREST)
+        image = image.astype(np.float32) / 255.0
+        image = (image - self.mean) / self.std
+        mask = (mask > 127).astype(np.float32)
+        image_tensor = torch.from_numpy(image.transpose(2, 0, 1)).float()
+        mask_tensor = torch.from_numpy(mask[None]).float()
+        return image_tensor, mask_tensor
 
 
 def _safe_link_or_copy(source: Path, target: Path) -> None:

@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from cloud_chaser.data.augmentations import IMAGENET_MEAN, IMAGENET_STD
 from cloud_chaser.data.augmentations import eval_transforms
 from cloud_chaser.models.classifier import CloudClassifier
 from cloud_chaser.utils.checkpoint import load_checkpoint
@@ -33,6 +34,10 @@ class CloudIdentifier:
         detector_weights: str | Path,
         classifier_weights: str | Path,
         class_names: list[str] | None = None,
+        detector_backend: str = "yolo",
+        unet_weights: str | Path | None = None,
+        unet_threshold: float = 0.45,
+        unet_min_area: int = 256,
         device: str = "cuda",
         image_size: int = 224,
         detector_conf: float = 0.25,
@@ -48,6 +53,18 @@ class CloudIdentifier:
         self.detector_iou = detector_iou
         self.half = half and self.device != "cpu"
         self.crop_padding = crop_padding
+        self.image_size = image_size
+        self.detector_backend = detector_backend
+        self.unet_threshold = unet_threshold
+        self.unet_min_area = unet_min_area
+        self.unet = None
+        if detector_backend in {"hybrid", "unet"} and unet_weights is not None and Path(unet_weights).exists():
+            from cloud_chaser.models.unet import CloudUNet
+
+            checkpoint = load_checkpoint(unet_weights, map_location=self.device)
+            self.unet = CloudUNet().to(self.device)
+            self.unet.load_state_dict(checkpoint["model"])
+            self.unet.eval()
         self.transform = eval_transforms(image_size)
 
         classifier_path = Path(classifier_weights)
@@ -76,18 +93,46 @@ class CloudIdentifier:
     ) -> list[torch.Tensor]:
         h, w = image_rgb.shape[:2]
         crops: list[torch.Tensor] = []
-        for mask_tensor, box_tensor in zip(masks, boxes, strict=False):
+        for _, box_tensor in zip(masks, boxes, strict=False):
             x1, y1, x2, y2 = [int(v) for v in box_tensor.tolist()]
             x1 = max(0, x1 - self.crop_padding)
             y1 = max(0, y1 - self.crop_padding)
             x2 = min(w, x2 + self.crop_padding)
             y2 = min(h, y2 + self.crop_padding)
-            mask = mask_tensor.detach().cpu().numpy().astype(bool)
-            masked = image_rgb.copy()
-            masked[~mask] = 0
-            crop = masked[y1:y2, x1:x2]
+            crop = image_rgb[y1:y2, x1:x2]
             crops.append(self.transform(image=crop)["image"])
         return crops
+
+    def _unet_instances(self, image_rgb: np.ndarray) -> tuple[torch.Tensor, torch.Tensor, list[float]]:
+        if self.unet is None:
+            return torch.empty((0, *image_rgb.shape[:2]), dtype=torch.bool), torch.empty((0, 4)), []
+        h, w = image_rgb.shape[:2]
+        resized = cv2.resize(image_rgb, (self.image_size, self.image_size), interpolation=cv2.INTER_AREA)
+        x = resized.astype(np.float32) / 255.0
+        x = (x - np.array(IMAGENET_MEAN, dtype=np.float32)) / np.array(IMAGENET_STD, dtype=np.float32)
+        tensor = torch.from_numpy(x.transpose(2, 0, 1))[None].float().to(self.device)
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.half):
+            prob = torch.sigmoid(self.unet(tensor))[0, 0].detach().float().cpu().numpy()
+        prob = cv2.resize(prob, (w, h), interpolation=cv2.INTER_LINEAR)
+        binary = prob >= self.unet_threshold
+        num_labels, labels = cv2.connectedComponents(binary.astype(np.uint8), connectivity=8)
+        masks: list[np.ndarray] = []
+        boxes: list[list[float]] = []
+        scores: list[float] = []
+        for component_id in range(1, num_labels):
+            mask = labels == component_id
+            area = int(mask.sum())
+            if area < self.unet_min_area:
+                continue
+            ys, xs = np.where(mask)
+            x1, x2 = int(xs.min()), int(xs.max()) + 1
+            y1, y2 = int(ys.min()), int(ys.max()) + 1
+            masks.append(mask)
+            boxes.append([x1, y1, x2, y2])
+            scores.append(float(prob[mask].mean()))
+        if not masks:
+            return torch.empty((0, h, w), dtype=torch.bool), torch.empty((0, 4)), []
+        return torch.from_numpy(np.stack(masks)).bool(), torch.tensor(boxes, dtype=torch.float32), scores
 
     @torch.no_grad()
     def predict(self, image_path: str | Path) -> tuple[np.ndarray, list[CloudPrediction]]:
@@ -97,24 +142,33 @@ class CloudIdentifier:
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         h, w = image_rgb.shape[:2]
 
-        results = self.detector.predict(
-            image_rgb,
-            conf=self.detector_conf,
-            iou=self.detector_iou,
-            retina_masks=True,
-            device=self.device,
-            half=self.half,
-            verbose=False,
-        )
-        result = results[0]
-        if result.masks is None or result.boxes is None or len(result.boxes) == 0:
-            return image_bgr, []
+        if self.detector_backend == "unet":
+            masks, boxes, detector_scores = self._unet_instances(image_rgb)
+        else:
+            results = self.detector.predict(
+                image_rgb,
+                conf=self.detector_conf,
+                iou=self.detector_iou,
+                retina_masks=True,
+                device=self.device,
+                half=self.half,
+                verbose=False,
+            )
+            result = results[0]
+            if result.masks is None or result.boxes is None or len(result.boxes) == 0:
+                if self.detector_backend == "hybrid":
+                    masks, boxes, detector_scores = self._unet_instances(image_rgb)
+                else:
+                    return image_bgr, []
+            else:
+                masks = result.masks.data
+                if masks.shape[-2:] != (h, w):
+                    masks = F.interpolate(masks[:, None].float(), size=(h, w), mode="nearest")[:, 0] > 0.5
+                boxes = result.boxes.xyxy.detach().cpu()
+                detector_scores = result.boxes.conf.detach().cpu().tolist()
 
-        masks = result.masks.data
-        if masks.shape[-2:] != (h, w):
-            masks = F.interpolate(masks[:, None].float(), size=(h, w), mode="nearest")[:, 0] > 0.5
-        boxes = result.boxes.xyxy.detach().cpu()
-        detector_scores = result.boxes.conf.detach().cpu().tolist()
+        if len(boxes) == 0:
+            return image_bgr, []
 
         crops = self._crop_instances(image_rgb, masks, boxes)
         batch = torch.stack(crops).to(self.device)

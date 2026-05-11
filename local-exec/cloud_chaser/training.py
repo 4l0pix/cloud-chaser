@@ -11,14 +11,12 @@ from cloud_chaser.config import get_device
 from cloud_chaser.data.augmentations import (
     classification_train_transforms,
     eval_transforms,
-    ssl_transforms,
 )
 from cloud_chaser.data.gcd import GCDDataset
-from cloud_chaser.data.swimseg import prepare_swimseg_yolo
-from cloud_chaser.data.tjnu import UnlabeledCloudDataset
+from cloud_chaser.data.swimseg import SwimsegMaskDataset, prepare_swimseg_yolo
 from cloud_chaser.models.classifier import CloudClassifier
 from cloud_chaser.models.detector import train_yolo_segmenter
-from cloud_chaser.models.simclr import SimCLR, nt_xent_loss
+from cloud_chaser.models.unet import CloudUNet
 from cloud_chaser.utils.checkpoint import load_checkpoint, save_checkpoint
 from cloud_chaser.utils.metrics import classification_metrics
 from cloud_chaser.utils.seed import seed_everything
@@ -52,78 +50,140 @@ def train_detector(cfg: dict) -> None:
     )
 
 
-def train_ssl(cfg: dict) -> None:
+def _segmentation_scores(logits: torch.Tensor, masks: torch.Tensor) -> tuple[float, float]:
+    preds = torch.sigmoid(logits) > 0.5
+    targets = masks > 0.5
+    intersection = (preds & targets).sum(dim=(1, 2, 3)).float()
+    union = (preds | targets).sum(dim=(1, 2, 3)).float().clamp_min(1.0)
+    pred_sum = preds.sum(dim=(1, 2, 3)).float()
+    target_sum = targets.sum(dim=(1, 2, 3)).float()
+    iou = (intersection / union).mean().item()
+    dice = ((2 * intersection + 1.0) / (pred_sum + target_sum + 1.0)).mean().item()
+    return iou, dice
+
+
+def _run_unet_epoch(
+    model: CloudUNet,
+    loader: DataLoader,
+    criterion: nn.Module,
+    device: str,
+    optimizer: torch.optim.Optimizer | None = None,
+) -> dict[str, float]:
+    training = optimizer is not None
+    model.train(training)
+    scaler = torch.cuda.amp.GradScaler(enabled=training and device == "cuda")
+    total_loss = 0.0
+    total_iou = 0.0
+    total_dice = 0.0
+    for images, masks in tqdm(loader, desc="unet-train" if training else "unet-eval"):
+        images = images.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
+        with torch.set_grad_enabled(training):
+            if training:
+                optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=device == "cuda"):
+                logits = model(images)
+                bce = criterion(logits, masks)
+                probs = torch.sigmoid(logits)
+                intersection = (probs * masks).sum(dim=(1, 2, 3))
+                dice_loss = 1 - ((2 * intersection + 1) / (probs.sum(dim=(1, 2, 3)) + masks.sum(dim=(1, 2, 3)) + 1)).mean()
+                loss = bce + dice_loss
+            if training:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+        iou, dice = _segmentation_scores(logits.detach(), masks.detach())
+        total_loss += float(loss.detach().cpu())
+        total_iou += iou
+        total_dice += dice
+    count = max(1, len(loader))
+    return {"loss": total_loss / count, "miou": total_iou / count, "dice": total_dice / count}
+
+
+def train_unet_detector(cfg: dict) -> None:
     seed_everything(cfg["project"]["seed"])
     device = get_device(cfg)
     data_cfg = cfg["data"]
-    ssl_cfg = cfg["ssl"]
-    tjnu_root = Path(data_cfg["tjnu_root"])
-    if not tjnu_root.exists():
-        print(f"Skipping optional SimCLR pretraining: TJNU dataset not found at {tjnu_root}")
-        print("Classifier training can continue from an ImageNet-pretrained backbone instead.")
-        return
-    dataset = UnlabeledCloudDataset(
-        tjnu_root,
-        ssl_transforms(data_cfg["image_size"], cfg["augmentation"]),
+    unet_cfg = cfg["unet"]
+    prepare_swimseg_yolo(
+        root=data_cfg["swimseg_root"],
+        output_dir=data_cfg["prepared_seg_dir"],
+        val_fraction=data_cfg.get("seg_val_fraction", 0.1),
+        test_fraction=data_cfg.get("seg_test_fraction", 0.1),
+        seed=cfg["project"]["seed"],
+        min_mask_area=data_cfg.get("min_mask_area", 96),
+        invert_masks=data_cfg.get("swimseg_invert_masks", False),
     )
-    loader = DataLoader(
-        dataset,
-        batch_size=ssl_cfg["batch_size"],
+    train_ds = SwimsegMaskDataset(data_cfg["prepared_seg_dir"], "train", data_cfg["image_size"])
+    val_ds = SwimsegMaskDataset(data_cfg["prepared_seg_dir"], "val", data_cfg["image_size"])
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=unet_cfg["batch_size"],
         shuffle=True,
         num_workers=data_cfg["num_workers"],
         pin_memory=device == "cuda",
-        drop_last=True,
     )
-    model = SimCLR(
-        backbone=ssl_cfg["backbone"],
-        projection_dim=ssl_cfg["projection_dim"],
-        hidden_dim=ssl_cfg["hidden_dim"],
-    ).to(device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=ssl_cfg["lr"],
-        weight_decay=ssl_cfg["weight_decay"],
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=unet_cfg["batch_size"],
+        shuffle=False,
+        num_workers=data_cfg["num_workers"],
+        pin_memory=device == "cuda",
     )
-    scaler = torch.cuda.amp.GradScaler(enabled=device == "cuda")
-    best_loss = float("inf")
-    output_dir = Path(cfg["project"]["output_dir"]) / "ssl"
-
-    for epoch in range(ssl_cfg["epochs"]):
-        model.train()
-        running_loss = 0.0
-        for view1, view2 in tqdm(loader, desc=f"SSL epoch {epoch + 1}/{ssl_cfg['epochs']}"):
-            view1 = view1.to(device, non_blocking=True)
-            view2 = view2.to(device, non_blocking=True)
-            optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=device == "cuda"):
-                loss = nt_xent_loss(model(view1), model(view2), ssl_cfg["temperature"])
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            running_loss += float(loss.detach().cpu())
-        epoch_loss = running_loss / max(1, len(loader))
-        save_checkpoint(
-            {
-                "epoch": epoch,
-                "backbone": ssl_cfg["backbone"],
-                "encoder": model.encoder.state_dict(),
-                "model": model.state_dict(),
-                "loss": epoch_loss,
-            },
-            output_dir / "last.pt",
+    model = CloudUNet().to(device)
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=unet_cfg["lr"], weight_decay=unet_cfg["weight_decay"])
+    output_dir = Path(cfg["project"]["output_dir"]) / "unet"
+    last_checkpoint = output_dir / "last.pt"
+    best_checkpoint = output_dir / "best.pt"
+    best_miou = -1.0
+    start_epoch = 0
+    resume_checkpoint = last_checkpoint if last_checkpoint.exists() else best_checkpoint if best_checkpoint.exists() else None
+    if resume_checkpoint is not None:
+        checkpoint = load_checkpoint(resume_checkpoint, map_location=device)
+        model.load_state_dict(checkpoint["model"])
+        if "optimizer" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+        start_epoch = int(checkpoint.get("epoch", -1)) + 1
+        best_miou = float(checkpoint.get("best_miou", checkpoint.get("val_metrics", {}).get("miou", -1.0)))
+        print(f"Resuming U-Net from {resume_checkpoint} at epoch {start_epoch + 1}")
+    for epoch in range(start_epoch, unet_cfg["epochs"]):
+        train_metrics = _run_unet_epoch(model, train_loader, criterion, device, optimizer)
+        val_metrics = _run_unet_epoch(model, val_loader, criterion, device)
+        print(
+            f"unet_epoch={epoch + 1} train_loss={train_metrics['loss']:.4f} "
+            f"val_miou={val_metrics['miou']:.4f} val_dice={val_metrics['dice']:.4f}"
         )
-        if epoch_loss < best_loss:
-            best_loss = epoch_loss
-            save_checkpoint(
-                {
-                    "epoch": epoch,
-                    "backbone": ssl_cfg["backbone"],
-                    "encoder": model.encoder.state_dict(),
-                    "model": model.state_dict(),
-                    "loss": epoch_loss,
-                },
-                output_dir / "best.pt",
-            )
+        payload = {
+            "epoch": epoch,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "val_metrics": val_metrics,
+            "best_miou": max(best_miou, val_metrics["miou"]),
+        }
+        save_checkpoint(payload, output_dir / "last.pt")
+        if val_metrics["miou"] > best_miou:
+            best_miou = val_metrics["miou"]
+            save_checkpoint(payload, output_dir / "best.pt")
+
+
+def evaluate_unet_detector(cfg: dict) -> dict[str, float]:
+    device = get_device(cfg)
+    data_cfg = cfg["data"]
+    checkpoint = load_checkpoint(cfg["unet"]["checkpoint"], map_location=device)
+    dataset = SwimsegMaskDataset(data_cfg["prepared_seg_dir"], "test", data_cfg["image_size"])
+    loader = DataLoader(
+        dataset,
+        batch_size=cfg["unet"]["batch_size"],
+        shuffle=False,
+        num_workers=data_cfg["num_workers"],
+        pin_memory=device == "cuda",
+    )
+    model = CloudUNet().to(device)
+    model.load_state_dict(checkpoint["model"])
+    metrics = _run_unet_epoch(model, loader, nn.BCEWithLogitsLoss(), device)
+    print(metrics)
+    return metrics
 
 
 def _run_classifier_epoch(
@@ -205,15 +265,24 @@ def train_classifier(cfg: dict) -> None:
         backbone=cls_cfg["backbone"],
         dropout=cls_cfg["dropout"],
     ).to(device)
-    if cls_cfg.get("ssl_checkpoint"):
-        checkpoint = load_checkpoint(cls_cfg["ssl_checkpoint"], map_location=device)
-        model.encoder.load_state_dict(checkpoint["encoder"], strict=False)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=cls_cfg["lr"], weight_decay=cls_cfg["weight_decay"])
     best_f1 = -1.0
     output_dir = Path(cfg["project"]["output_dir"]) / "classifier"
+    last_checkpoint = output_dir / "last.pt"
+    best_checkpoint = output_dir / "best.pt"
+    start_epoch = 0
+    resume_checkpoint = last_checkpoint if last_checkpoint.exists() else best_checkpoint if best_checkpoint.exists() else None
+    if resume_checkpoint is not None:
+        checkpoint = load_checkpoint(resume_checkpoint, map_location=device)
+        model.load_state_dict(checkpoint["model"])
+        if "optimizer" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+        start_epoch = int(checkpoint.get("epoch", -1)) + 1
+        best_f1 = float(checkpoint.get("best_f1", checkpoint.get("val_metrics", {}).get("f1_macro", -1.0)))
+        print(f"Resuming classifier from {resume_checkpoint} at epoch {start_epoch + 1}")
 
-    for epoch in range(cls_cfg["epochs"]):
+    for epoch in range(start_epoch, cls_cfg["epochs"]):
         model.freeze_encoder(epoch < cls_cfg.get("freeze_backbone_epochs", 0))
         train_metrics = _run_classifier_epoch(
             model, train_loader, criterion, device, optimizer=optimizer, amp=cls_cfg["amp"]
@@ -228,7 +297,9 @@ def train_classifier(cfg: dict) -> None:
             "classes": train_ds.classes,
             "backbone": cls_cfg["backbone"],
             "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
             "val_metrics": val_metrics,
+            "best_f1": max(best_f1, val_metrics["f1_macro"]),
         }
         save_checkpoint(payload, output_dir / "last.pt")
         if val_metrics["f1_macro"] > best_f1:

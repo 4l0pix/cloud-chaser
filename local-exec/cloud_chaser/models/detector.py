@@ -18,7 +18,11 @@ def train_yolo_segmenter(
     from ultralytics import YOLO
 
     output_dir = Path(output_dir)
-    yolo = YOLO(model_name_or_path)
+    last_checkpoint = output_dir / "weights" / "last.pt"
+    best_checkpoint = output_dir / "weights" / "best.pt"
+    resume = last_checkpoint.exists()
+    weights = str(last_checkpoint) if resume else str(best_checkpoint) if best_checkpoint.exists() else model_name_or_path
+    yolo = YOLO(weights)
     return yolo.train(
         data=str(data_yaml),
         task="segment",
@@ -32,4 +36,6 @@ def train_yolo_segmenter(
         lr0=lr0,
         weight_decay=weight_decay,
         amp=True,
+        resume=resume,
+        exist_ok=True,
     )

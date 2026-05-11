@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Any
-
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
@@ -52,18 +50,3 @@ def eval_transforms(image_size: int) -> A.Compose:
         ]
     )
 
-
-def ssl_transforms(image_size: int, aug_cfg: dict[str, Any]) -> A.Compose:
-    return A.Compose(
-        [
-            random_resized_crop(image_size, scale=(0.45, 1.0), ratio=(0.75, 1.33)),
-            A.HorizontalFlip(p=aug_cfg.get("hflip_p", 0.5)),
-            A.VerticalFlip(p=aug_cfg.get("vflip_p", 0.15)),
-            A.RandomShadow(p=aug_cfg.get("random_shadow_p", 0.25)),
-            A.GaussianBlur(blur_limit=(3, 7), p=aug_cfg.get("gaussian_blur_p", 0.2)),
-            A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.04, p=0.55),
-            A.ToGray(p=0.05),
-            A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-            ToTensorV2(),
-        ]
-    )

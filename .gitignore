@@ -1,13 +1,19 @@
 __pycache__/
 *.py[cod]
+*.egg-info/
 .pytest_cache/
 .ruff_cache/
 .venv/
 venv/
 
-/data/
+/data/*
+!/data/README.md
 /runs/
 /weights/
+/results/*
+!/results/README.md
+/models/*
+!/models/README.md
 *.pt
 *.pth
 *.onnx

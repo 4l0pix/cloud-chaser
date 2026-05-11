@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10,<3.13"
 dependencies = [
   "albumentations>=1.4.0",
+  "matplotlib>=3.8",
   "numpy>=1.24",
   "opencv-python>=4.8",
   "pillow>=10.0",

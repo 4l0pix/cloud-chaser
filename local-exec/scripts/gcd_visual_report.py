@@ -42,6 +42,10 @@ def _evaluate_cascade(cfg: dict, output_dir: Path, samples: int) -> tuple[dict, 
         detector_weights=cfg["inference"]["detector_weights"],
         classifier_weights=cfg["inference"]["classifier_weights"],
         class_names=classes,
+        detector_backend=cfg["detector"].get("backend", "yolo"),
+        unet_weights=cfg.get("unet", {}).get("checkpoint"),
+        unet_threshold=cfg.get("unet", {}).get("threshold", 0.45),
+        unet_min_area=cfg.get("unet", {}).get("min_area", 256),
         device=get_device(cfg),
         image_size=cfg["data"]["image_size"],
         detector_conf=cfg["detector"]["conf"],
@@ -207,6 +211,10 @@ def _make_overlay_grid(cfg: dict, output_dir: Path, details: list[dict], samples
         detector_weights=cfg["inference"]["detector_weights"],
         classifier_weights=cfg["inference"]["classifier_weights"],
         class_names=classes,
+        detector_backend=cfg["detector"].get("backend", "yolo"),
+        unet_weights=cfg.get("unet", {}).get("checkpoint"),
+        unet_threshold=cfg.get("unet", {}).get("threshold", 0.45),
+        unet_min_area=cfg.get("unet", {}).get("min_area", 256),
         device=get_device(cfg),
         image_size=cfg["data"]["image_size"],
         detector_conf=cfg["detector"]["conf"],
@@ -247,7 +255,7 @@ def _make_overlay_grid(cfg: dict, output_dir: Path, details: list[dict], samples
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate the GCD detector-classifier cascade.")
     parser.add_argument("--config", default="configs/default.yaml")
-    parser.add_argument("--output-dir", default="/kaggle/working/cloud-chaser/reports")
+    parser.add_argument("--output-dir", default="reports")
     parser.add_argument("--samples", type=int, default=9)
     args = parser.parse_args()
 
