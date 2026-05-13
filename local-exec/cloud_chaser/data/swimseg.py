@@ -13,7 +13,6 @@ import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from cloud_chaser.config import save_yaml
 from cloud_chaser.data.augmentations import IMAGENET_MEAN, IMAGENET_STD
 from cloud_chaser.data.gcd import IMAGE_EXTENSIONS
 
@@ -116,31 +115,6 @@ def discover_swimseg_pairs(root: str | Path) -> list[SwimsegPair]:
     return pairs
 
 
-def _mask_to_yolo_polygons(mask: np.ndarray, min_area: int) -> list[list[float]]:
-    mask = mask.astype(np.uint8)
-    num_labels, labels = cv2.connectedComponents(mask, connectivity=8)
-    h, w = mask.shape[:2]
-    polygons: list[list[float]] = []
-    for component_id in range(1, num_labels):
-        component = (labels == component_id).astype(np.uint8)
-        if int(component.sum()) < min_area:
-            continue
-        contours, _ = cv2.findContours(component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for contour in contours:
-            if cv2.contourArea(contour) < min_area or len(contour) < 3:
-                continue
-            epsilon = 0.0025 * cv2.arcLength(contour, True)
-            approx = cv2.approxPolyDP(contour, epsilon, True).reshape(-1, 2)
-            if len(approx) < 3:
-                continue
-            coords: list[float] = []
-            for x, y in approx:
-                coords.extend([float(np.clip(x / w, 0, 1)), float(np.clip(y / h, 0, 1))])
-            if len(coords) >= 6:
-                polygons.append(coords)
-    return polygons
-
-
 def _binary_cloud_mask(mask_path: Path, invert: bool = False) -> np.ndarray:
     mask = np.array(Image.open(mask_path).convert("L"))
     binary = mask > 127
@@ -204,13 +178,12 @@ def _safe_link_or_copy(source: Path, target: Path) -> None:
         cv2.imwrite(str(target), image)
 
 
-def prepare_swimseg_yolo(
+def prepare_swimseg_masks(
     root: str | Path,
     output_dir: str | Path,
     val_fraction: float = 0.1,
     test_fraction: float = 0.1,
     seed: int = 42,
-    min_mask_area: int = 96,
     invert_masks: bool = False,
 ) -> Path:
     output_dir = Path(output_dir)
@@ -240,34 +213,12 @@ def prepare_swimseg_yolo(
                 binary = _binary_cloud_mask(pair.mask_path, invert=invert_masks)
                 if binary.shape != (h, w):
                     binary = cv2.resize(binary, (w, h), interpolation=cv2.INTER_NEAREST)
-                polygons = _mask_to_yolo_polygons(binary, min_area=min_mask_area)
-                if not polygons:
-                    continue
 
                 target_image = output_dir / "images" / split / pair.image_path.name
                 target_mask = output_dir / "masks" / split / f"{pair.image_path.stem}.png"
-                label_path = output_dir / "labels" / split / f"{pair.image_path.stem}.txt"
                 _safe_link_or_copy(pair.image_path, target_image)
                 target_mask.parent.mkdir(parents=True, exist_ok=True)
                 cv2.imwrite(str(target_mask), binary * 255)
-                label_path.parent.mkdir(parents=True, exist_ok=True)
-                label_path.write_text(
-                    "\n".join("0 " + " ".join(f"{v:.6f}" for v in poly) for poly in polygons) + "\n",
-                    encoding="utf-8",
-                )
                 writer.writerow({"split": split, "image": str(target_image), "mask": str(target_mask)})
 
-    data_yaml = {
-        "path": str(output_dir.resolve()),
-        "train": "images/train",
-        "val": "images/val",
-        "test": "images/test",
-        "names": {0: "cloud"},
-        "metadata": {
-            "source": "SWIMSEG cloud-mask dataset",
-            "binary_mask_cloud_value": "white unless swimseg_invert_masks=true",
-            "pairs_discovered": len(pairs),
-        },
-    }
-    save_yaml(data_yaml, output_dir / "cloud_seg.yaml")
-    return output_dir / "cloud_seg.yaml"
+    return manifest_path

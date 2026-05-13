@@ -19,20 +19,15 @@ def main() -> None:
     cfg = load_config(args.config)
     data_cfg = cfg["data"]
     inf_cfg = cfg["inference"]
-    det_cfg = cfg["detector"]
     identifier = CloudIdentifier(
-        detector_weights=inf_cfg["detector_weights"],
+        unet_weights=inf_cfg["unet_weights"],
         classifier_weights=inf_cfg["classifier_weights"],
         class_names=data_cfg["classification_classes"],
-        detector_backend=det_cfg.get("backend", "yolo"),
-        unet_weights=cfg.get("unet", {}).get("checkpoint"),
         unet_threshold=cfg.get("unet", {}).get("threshold", 0.45),
         unet_min_area=cfg.get("unet", {}).get("min_area", 256),
         device=get_device(cfg),
         image_size=data_cfg["image_size"],
-        detector_conf=det_cfg["conf"],
-        detector_iou=det_cfg["iou"],
-        half=det_cfg["half"],
+        half=cfg.get("unet", {}).get("half", True),
         crop_padding=inf_cfg["crop_padding"],
     )
     overlay, predictions = identifier.predict(args.image)
@@ -42,7 +37,7 @@ def main() -> None:
     for pred in predictions:
         print(
             f"{pred.class_name}: class={pred.class_confidence:.3f} "
-            f"detector={pred.detector_confidence:.3f} box={pred.box}"
+            f"segmenter={pred.segmentation_confidence:.3f} box={pred.box}"
         )
     print(f"saved={output}")
 

@@ -8,5 +8,5 @@ Expected layout:
 data/swimseg-2/**              # SWIMSEG/SkyImage image-mask pairs
 data/GCD/train/<class>/*.jpg
 data/GCD/test/<class>/*.jpg
-data/processed/                # generated YOLO/SWIMSEG labels
+data/processed/                # generated SWIMSEG train/val/test image-mask manifests
 ```

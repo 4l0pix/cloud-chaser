@@ -50,3 +50,25 @@ def eval_transforms(image_size: int) -> A.Compose:
         ]
     )
 
+
+def contrastive_train_transforms(image_size: int) -> A.Compose:
+    return A.Compose(
+        [
+            random_resized_crop(image_size, scale=(0.45, 1.0), ratio=(0.75, 1.33)),
+            A.OneOf(
+                [
+                    A.Rotate(limit=(90, 90), p=1.0),
+                    A.Rotate(limit=(180, 180), p=1.0),
+                    A.Rotate(limit=(270, 270), p=1.0),
+                ],
+                p=0.35,
+            ),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.25),
+            A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.04, p=0.6),
+            A.GaussNoise(p=0.25),
+            A.GaussianBlur(blur_limit=(3, 7), p=0.3),
+            A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+            ToTensorV2(),
+        ]
+    )

@@ -7,7 +7,7 @@ project:
 data:
   swimseg_root: ../data/swimseg-2
   gcd_root: ../data/GCD
-  prepared_seg_dir: ../data/processed/swimseg_cloud_yolo
+  prepared_seg_dir: ../data/processed/swimseg_cloud_masks
   num_workers: 8
   image_size: 224
   val_fraction: 0.15
@@ -30,41 +30,65 @@ augmentation:
   hflip_p: 0.50
   vflip_p: 0.15
 
-detector:
-  backend: hybrid
-  model: ../models/yolo11s-seg.pt
-  epochs: 120
-  imgsz: 640
-  batch: 8
-  patience: 35
-  lr0: 0.01
-  weight_decay: 0.0005
-  conf: 0.25
-  iou: 0.60
-  half: true
-
 unet:
   checkpoint: ../results/unet/best.pt
+  architecture: compact
+  features: [32, 64, 128, 256]
   epochs: 60
   batch_size: 8
   lr: 0.0003
   weight_decay: 0.00001
   threshold: 0.45
   min_area: 256
+  half: true
+
+experiments:
+  unet_variants:
+    - name: baseline_a_compact
+      architecture: compact
+      features: [32, 64, 128, 256]
+    - name: baseline_b_medium
+      architecture: standard
+      features: [64, 128, 256, 512]
+    - name: model_c_dilated
+      architecture: dilated
+      features: [64, 128, 256, 512]
+    - name: model_d_dilated_aspp
+      architecture: dilated_aspp
+      features: [64, 128, 256, 512]
+    - name: model_e_bicubic
+      architecture: bicubic
+      features: [64, 128, 256, 512]
+    - name: model_f_improved
+      architecture: improved
+      features: [64, 128, 256, 512]
 
 classifier:
   backbone: resnet50
-  batch_size: 32
-  epochs: 80
-  lr: 0.0001
+  batch_size: 16
+  epochs: 200
+  lr: 0.01
   weight_decay: 0.0001
+  optimizer: sgd
+  momentum: 0.9
   dropout: 0.2
   amp: true
   freeze_backbone_epochs: 2
   checkpoint: ../results/classifier/best.pt
+  ssl:
+    enabled: true
+    checkpoint: ../results/classifier_ssl/best.pt
+    projection_dim: 128
+    queue_size: 4096
+    temperature: 0.5
+    momentum: 0.999
+    batch_size: 64
+    epochs: 200
+    lr: 0.03
+    weight_decay: 0.0001
 
 inference:
-  detector_weights: ../results/detector/weights/best.pt
+  unet_weights: ../results/unet/best.pt
   classifier_weights: ../results/classifier/best.pt
   output_dir: ../results/inference
   crop_padding: 12

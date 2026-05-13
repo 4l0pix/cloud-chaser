@@ -32,9 +32,8 @@ Run from `local-exec/`:
 
 ```bash
 cd local-exec
-python -m scripts.prepare_swimseg_yolo --config configs/default.yaml
-python train.py detector --config configs/default.yaml
 python train.py unet --config configs/default.yaml
+python train.py classifier-ssl --config configs/default.yaml
 python train.py classifier --config configs/default.yaml
 ```
 
@@ -43,10 +42,10 @@ Training resumes from `last.pt` when present, otherwise from `best.pt`, otherwis
 ## Evaluation
 
 ```bash
-python train.py eval-detector --config configs/default.yaml
 python train.py eval-unet --config configs/default.yaml
 python train.py eval-classifier --config configs/default.yaml
 python scripts/gcd_visual_report.py --config configs/default.yaml --output-dir ../results/reports
+python scripts/unet_ablation_report.py --config configs/default.yaml --output-dir ../results/reports/unet_ablation
 ```
 
 ## Inference
@@ -61,6 +60,6 @@ python inference.py \
 ## Export
 
 ```bash
-python export.py detector --config configs/default.yaml --format onnx
+python export.py unet --config configs/default.yaml --format torchscript --output ../models/unet.torchscript
 python export.py classifier --config configs/default.yaml --format torchscript --output ../models/classifier.torchscript
 ```

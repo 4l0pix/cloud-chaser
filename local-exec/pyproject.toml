@@ -19,7 +19,6 @@ dependencies = [
   "torch>=2.1",
   "torchvision>=0.16",
   "tqdm>=4.66",
-  "ultralytics>=8.2.0",
 ]
 
 [project.optional-dependencies]

@@ -1,48 +1,68 @@
 # Cloud Chaser
 
-Cloud Chaser is a hybrid cloud detection and cloud-type classification pipeline. It detects cloud regions with a YOLO-Seg primary detector and a U-Net fallback detector, then classifies the detected RGB crop into one of the seven GCD cloud categories.
-
-The current best pipeline is:
+Cloud Chaser is now a U-Net-only cloud segmentation and cloud-type classification research pipeline. It compares six U-Net variants trained on SWIMSEG/SkyImage masks, converts connected cloud regions into RGB crops, then classifies each crop into one of the seven GCD cloud categories with a contrastive self-supervised ResNet50 classifier.
 
 ```text
 image
-  -> YOLO-Seg cloud detector
-  -> if YOLO finds no cloud, U-Net fallback detector
+  -> U-Net cloud segmentation variant A-F
+  -> threshold cloud probability map
+  -> connected cloud components + boxes
   -> RGB bounding-box crop from the original image
   -> GCD cloud-type classifier
   -> mask/box/class overlay and cascade metrics
 ```
 
-The detector mask is used for localization and visualization only. The classifier receives the normal RGB crop from the original image, not a blacked-out mask crop.
+The segmentation mask is used for localization and visualization only. The classifier receives the normal RGB crop from the original image, not a blacked-out mask crop.
 
 ## Repository Layout
 
 ```text
 kaggle/       Kaggle notebook and Kaggle-specific workflow files
 local-exec/   Local Python package, CLI scripts, configs, and training code
-docs/         Documentation, notes, and papers
+docs/         Documentation, notes, papers, and architecture plans
 venv/         Suggested local virtual environment location
 requirements.txt
 data/         Local datasets, ignored by git
-models/       Local pretrained/downloaded weights, ignored by git except docs
+models/       Local exported model artifacts, ignored by git except docs
 README.md
 results/      Local training/evaluation/inference outputs, ignored by git except docs
 ```
 
 ## Architecture
 
-### 1. Hybrid Detection
+### 1. U-Net Segmentation Experiments
 
-The detector stage has two backends:
+Each segmenter predicts a binary cloud probability map:
 
-- **YOLO-Seg primary detector**: fast instance segmentation, trained from `yolo11s-seg.pt` on SWIMSEG cloud masks converted to YOLO polygon labels.
-- **U-Net fallback detector**: dense semantic segmentation trained on the same SWIMSEG binary masks. It runs when YOLO returns no detections.
+```text
+input:  RGB image, resized to 224 x 224
+output: 1-channel cloud logit map
+```
 
-YOLO returns masks, boxes, and detector confidences directly. U-Net returns a cloud probability map; the pipeline thresholds it, removes small components, extracts connected components, and converts those components into masks, boxes, and confidence scores.
+At inference time:
 
-### 2. Classification
+```text
+sigmoid(logits)
+threshold at unet.threshold
+remove connected components smaller than unet.min_area
+extract boxes from surviving components
+confidence = mean cloud probability inside component
+```
 
-The classifier is a PyTorch CNN, currently ResNet50 by default, trained on the seven GCD classes:
+The six research variants are:
+
+```text
+Baseline A: compact U-Net, features=[32,64,128,256]
+Baseline B: Medium-style U-Net, features=[64,128,256,512]
+Model C:    dilated encoder U-Net
+Model D:    dilated + ASPP encoder U-Net
+Model E:    dilated + ASPP encoder with bicubic decoder
+Model F:    improved U-Net with DS skip path + Im-CSAM attention
+```
+
+### 2. CSSL Classification
+
+The classifier follows the contrastive self-supervised learning paper in `docs/papers/`: ResNet50 is first pretrained with MoCo-style InfoNCE contrastive learning, then fine-tuned with a fully connected classification head on the seven GCD classes:
 
 ```text
 1_cumulus
@@ -54,30 +74,30 @@ The classifier is a PyTorch CNN, currently ResNet50 by default, trained on the s
 7_mixed
 ```
 
-The classifier input is the RGB crop inside the detector bounding box. The detector mask is not applied to classifier pixels.
+The classifier input is the RGB crop inside the U-Net component bounding box.
 
 ### 3. Cascade Evaluation
 
 GCD has image-level class labels but no cloud masks, so final validation uses image-level cascade metrics:
 
-- **detector image accuracy**: cloudy classes should produce at least one detection; clear-sky images should produce none.
-- **classifier accuracy given detection**: classification accuracy only among images where a cloud was detected.
-- **cascade accuracy**: end-to-end success after both detection and classification.
+- **segmentation gate accuracy**: cloudy classes should produce at least one U-Net cloud component; clear-sky images should produce none.
+- **classifier accuracy given component**: classification accuracy only among images where a cloud component was produced.
+- **cascade accuracy**: end-to-end success after both segmentation gate and classification.
 
 The report outputs are:
 
 ```text
-results/reports/gcd_val_cascade_bar.png
-results/reports/gcd_val_cascade_overlay_samples.jpg
-results/reports/gcd_val_cascade_metrics.json
+results/reports/gcd_val_unet_cascade_bar.png
+results/reports/gcd_val_unet_cascade_overlay_samples.jpg
+results/reports/gcd_val_unet_cascade_metrics.json
+results/reports/unet_ablation/unet_ablation_summary.csv
+results/reports/unet_ablation/unet_ablation_summary.png
 ```
 
-On Kaggle, the equivalent paths are:
+On Kaggle, the equivalent paths are under:
 
 ```text
-/kaggle/working/reports/gcd_val_cascade_bar.png
-/kaggle/working/reports/gcd_val_cascade_overlay_samples.jpg
-/kaggle/working/reports/gcd_val_cascade_metrics.json
+/kaggle/working/reports
 ```
 
 ## Local Quick Start
@@ -104,16 +124,20 @@ Run local training from `local-exec/`:
 
 ```bash
 cd local-exec
-python -m scripts.prepare_swimseg_yolo --config configs/default.yaml
-python train.py detector --config configs/default.yaml
 python train.py unet --config configs/default.yaml
+python train.py classifier-ssl --config configs/default.yaml
 python train.py classifier --config configs/default.yaml
+```
+
+Run the full six-pipeline research comparison:
+
+```bash
+python scripts/unet_ablation_report.py --config configs/default.yaml --output-dir ../results/reports/unet_ablation
 ```
 
 Evaluate:
 
 ```bash
-python train.py eval-detector --config configs/default.yaml
 python train.py eval-unet --config configs/default.yaml
 python train.py eval-classifier --config configs/default.yaml
 python scripts/gcd_visual_report.py --config configs/default.yaml --output-dir ../results/reports
@@ -151,8 +175,8 @@ The notebook writes its own working copy to Kaggle, restores checkpoints from th
 Local checkpoints are written under:
 
 ```text
-results/detector/weights/
 results/unet/
+results/classifier_ssl/
 results/classifier/
 ```
 
@@ -168,4 +192,4 @@ For longer experiments, increase the target total epoch counts in:
 local-exec/configs/default.yaml
 ```
 
-The epoch value is a total target, not an additive number. For example, if the classifier has reached epoch 40 and `epochs: 80`, the next run continues toward epoch 80.
+The epoch value is a total target, not an additive number. For example, if the U-Net has reached epoch 40 and `epochs: 80`, the next run continues toward epoch 80.

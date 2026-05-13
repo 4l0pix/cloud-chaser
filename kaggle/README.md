@@ -2,7 +2,7 @@
 
 This folder contains Kaggle-specific files.
 
-Use `cloud_chaser_kaggle.ipynb` in Kaggle. The notebook materializes the Python project inside `/kaggle/working`, restores saved checkpoints from an attached output dataset when available, resumes training, and writes results to simple Kaggle paths:
+Use `cloud_chaser_kaggle.ipynb` in Kaggle. The notebook materializes the Python project inside `/kaggle/working`, restores saved U-Net/classifier checkpoints from an attached output dataset when available, resumes training, and writes results to simple Kaggle paths:
 
 ```text
 /kaggle/working/runs
@@ -12,22 +12,14 @@ Use `cloud_chaser_kaggle.ipynb` in Kaggle. The notebook materializes the Python 
 /kaggle/working/prediction.jpg
 ```
 
-The validation report cell now runs an experimental backend comparison across:
+The validation report writes:
 
 ```text
-yolo
-unet
-hybrid
+/kaggle/working/reports/gcd_val_unet_cascade_bar.png
+/kaggle/working/reports/gcd_val_unet_cascade_overlay_samples.jpg
+/kaggle/working/reports/gcd_val_unet_cascade_metrics.json
+/kaggle/working/reports/unet_ablation/unet_ablation_summary.csv
+/kaggle/working/reports/unet_ablation/unet_ablation_summary.png
 ```
 
-It writes:
-
-```text
-/kaggle/working/reports/gcd_backend_experiment_comparison.png
-/kaggle/working/reports/gcd_backend_experiment_summary.csv
-/kaggle/working/reports/gcd_val_yolo_cascade_*.png|jpg|json
-/kaggle/working/reports/gcd_val_unet_cascade_*.png|jpg|json
-/kaggle/working/reports/gcd_val_hybrid_cascade_*.png|jpg|json
-```
-
-The notebook should be treated as the Kaggle entrypoint; the local code lives in `local-exec/`.
+The notebook is now the experimental entrypoint for comparing all six U-Net segmenters before the GCD classifier. The local code lives in `local-exec/`.

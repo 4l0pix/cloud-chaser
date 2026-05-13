@@ -25,8 +25,8 @@ def _is_clear_sky(class_name: str) -> bool:
 def _best_image_prediction(predictions) -> tuple[str | None, float]:
     if not predictions:
         return None, 0.0
-    best = max(predictions, key=lambda p: p.detector_confidence * p.class_confidence)
-    return best.class_name, best.detector_confidence * best.class_confidence
+    best = max(predictions, key=lambda p: p.segmentation_confidence * p.class_confidence)
+    return best.class_name, best.segmentation_confidence * best.class_confidence
 
 
 def _report_path(output_dir: Path, prefix: str, suffix: str) -> Path:
@@ -37,7 +37,6 @@ def _evaluate_cascade(
     cfg: dict,
     output_dir: Path,
     samples: int,
-    backend: str,
     prefix: str,
 ) -> tuple[dict, list[dict]]:
     records, classes = build_gcd_records(
@@ -49,24 +48,20 @@ def _evaluate_cascade(
     )
     clear_sky = [_is_clear_sky(name) for name in classes]
     identifier = CloudIdentifier(
-        detector_weights=cfg["inference"]["detector_weights"],
+        unet_weights=cfg["inference"]["unet_weights"],
         classifier_weights=cfg["inference"]["classifier_weights"],
         class_names=classes,
-        detector_backend=backend,
-        unet_weights=cfg.get("unet", {}).get("checkpoint"),
         unet_threshold=cfg.get("unet", {}).get("threshold", 0.45),
         unet_min_area=cfg.get("unet", {}).get("min_area", 256),
         device=get_device(cfg),
         image_size=cfg["data"]["image_size"],
-        detector_conf=cfg["detector"]["conf"],
-        detector_iou=cfg["detector"]["iou"],
-        half=cfg["detector"]["half"],
+        half=cfg.get("unet", {}).get("half", True),
         crop_padding=cfg["inference"]["crop_padding"],
     )
 
     n = len(classes)
     total_by_class = np.zeros(n, dtype=np.int64)
-    detection_correct_by_class = np.zeros(n, dtype=np.int64)
+    segmentation_gate_correct_by_class = np.zeros(n, dtype=np.int64)
     detected_by_class = np.zeros(n, dtype=np.int64)
     classified_correct_by_class = np.zeros(n, dtype=np.int64)
     classified_total_by_class = np.zeros(n, dtype=np.int64)
@@ -85,7 +80,7 @@ def _evaluate_cascade(
         pred_name, pred_score = _best_image_prediction(predictions)
         pred_idx = display_to_idx.get(pred_name) if pred_name is not None else None
 
-        detection_correct = has_detection if expects_cloud else not has_detection
+        segmentation_gate_correct = has_detection if expects_cloud else not has_detection
         classification_correct = pred_idx == true_idx if has_detection and pred_idx is not None else False
         if expects_cloud:
             cascade_correct = has_detection and classification_correct
@@ -94,7 +89,7 @@ def _evaluate_cascade(
 
         total_by_class[true_idx] += 1
         detected_by_class[true_idx] += int(has_detection)
-        detection_correct_by_class[true_idx] += int(detection_correct)
+        segmentation_gate_correct_by_class[true_idx] += int(segmentation_gate_correct)
         cascade_correct_by_class[true_idx] += int(cascade_correct)
         if has_detection and pred_idx is not None:
             classified_total_by_class[true_idx] += 1
@@ -107,7 +102,7 @@ def _evaluate_cascade(
                 "true_class": true_name,
                 "expects_cloud": expects_cloud,
                 "has_detection": has_detection,
-                "detection_correct": bool(detection_correct),
+                "segmentation_gate_correct": bool(segmentation_gate_correct),
                 "predicted_class": pred_name,
                 "prediction_score": float(pred_score),
                 "classification_correct": bool(classification_correct),
@@ -116,7 +111,7 @@ def _evaluate_cascade(
             }
         )
 
-    detection_accuracy = float(detection_correct_by_class.sum() / max(total_by_class.sum(), 1))
+    segmentation_gate_accuracy = float(segmentation_gate_correct_by_class.sum() / max(total_by_class.sum(), 1))
     conditional_classification_accuracy = float(
         classified_correct_by_class.sum() / max(classified_total_by_class.sum(), 1)
     )
@@ -124,20 +119,20 @@ def _evaluate_cascade(
 
     metrics = {
         "split": "val",
-        "detector_backend": backend,
+        "segmenter": "unet",
         "num_images": int(total_by_class.sum()),
         "classes": classes,
         "note": (
-            "GCD has image-level class labels but no cloud masks. Detection is evaluated as an "
+            "GCD has image-level class labels but no cloud masks. U-Net segmentation is evaluated as an "
             "image-level cascade gate: non-clearsky classes should produce at least one cloud "
             "detection, while clearsky should produce none."
         ),
-        "detector_image_accuracy": detection_accuracy,
+        "segmentation_gate_accuracy": segmentation_gate_accuracy,
         "classifier_accuracy_given_detection": conditional_classification_accuracy,
         "cascade_accuracy": cascade_accuracy,
         "total_by_class": total_by_class.tolist(),
         "detected_by_class": detected_by_class.tolist(),
-        "detection_correct_by_class": detection_correct_by_class.tolist(),
+        "segmentation_gate_correct_by_class": segmentation_gate_correct_by_class.tolist(),
         "classified_total_by_class": classified_total_by_class.tolist(),
         "classified_correct_by_class": classified_correct_by_class.tolist(),
         "cascade_correct_by_class": cascade_correct_by_class.tolist(),
@@ -146,14 +141,14 @@ def _evaluate_cascade(
     }
     _report_path(output_dir, prefix, "metrics.json").write_text(json.dumps(metrics, indent=2))
     _plot_cascade_bars(metrics, output_dir, prefix)
-    overlay_path = _make_overlay_grid(cfg, output_dir, details, samples, backend, prefix)
+    overlay_path = _make_overlay_grid(cfg, output_dir, details, samples, prefix)
     return metrics, details if overlay_path else details
 
 
 def _plot_cascade_bars(metrics: dict, output_dir: Path, prefix: str) -> None:
     labels = [display_class_name(name) for name in metrics["classes"]]
     total = np.array(metrics["total_by_class"])
-    detection_correct = np.array(metrics["detection_correct_by_class"])
+    segmentation_gate_correct = np.array(metrics["segmentation_gate_correct_by_class"])
     classified_total = np.array(metrics["classified_total_by_class"])
     classified_correct = np.array(metrics["classified_correct_by_class"])
     cascade_correct = np.array(metrics["cascade_correct_by_class"])
@@ -161,12 +156,12 @@ def _plot_cascade_bars(metrics: dict, output_dir: Path, prefix: str) -> None:
     x = np.arange(len(labels))
     width = 0.26
     fig, ax = plt.subplots(figsize=(13, 6.5))
-    b1 = ax.bar(x - width, detection_correct, width, color="#457b9d", label="Detection correct")
+    b1 = ax.bar(x - width, segmentation_gate_correct, width, color="#457b9d", label="U-Net gate correct")
     b2 = ax.bar(x, classified_correct, width, color="#2a9d8f", label="Classified correct after detection")
     b3 = ax.bar(x + width, cascade_correct, width, color="#e76f51", label="End-to-end correct")
     ax.set_title(
-        f"GCD validation cascade ({metrics['detector_backend']}): cloud detection -> cloud type classification\n"
-        f"det={metrics['detector_image_accuracy']:.1%}, "
+        "GCD validation cascade: U-Net cloud segmentation -> cloud type classification\n"
+        f"seg-gate={metrics['segmentation_gate_accuracy']:.1%}, "
         f"cls|det={metrics['classifier_accuracy_given_detection']:.1%}, "
         f"end-to-end={metrics['cascade_accuracy']:.1%}"
     )
@@ -217,7 +212,6 @@ def _make_overlay_grid(
     output_dir: Path,
     details: list[dict],
     samples: int,
-    backend: str,
     prefix: str,
 ) -> Path | None:
     selected = _select_samples(details, samples, cfg["project"]["seed"])
@@ -226,18 +220,14 @@ def _make_overlay_grid(
 
     classes = cfg["data"].get("classification_classes")
     identifier = CloudIdentifier(
-        detector_weights=cfg["inference"]["detector_weights"],
+        unet_weights=cfg["inference"]["unet_weights"],
         classifier_weights=cfg["inference"]["classifier_weights"],
         class_names=classes,
-        detector_backend=backend,
-        unet_weights=cfg.get("unet", {}).get("checkpoint"),
         unet_threshold=cfg.get("unet", {}).get("threshold", 0.45),
         unet_min_area=cfg.get("unet", {}).get("min_area", 256),
         device=get_device(cfg),
         image_size=cfg["data"]["image_size"],
-        detector_conf=cfg["detector"]["conf"],
-        detector_iou=cfg["detector"]["iou"],
-        half=cfg["detector"]["half"],
+        half=cfg.get("unet", {}).get("half", True),
         crop_padding=cfg["inference"]["crop_padding"],
     )
 
@@ -271,11 +261,10 @@ def _make_overlay_grid(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate the GCD detector-classifier cascade.")
+    parser = argparse.ArgumentParser(description="Evaluate the GCD U-Net segmentation/classification cascade.")
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--output-dir", default="reports")
     parser.add_argument("--samples", type=int, default=9)
-    parser.add_argument("--backend", choices=["yolo", "unet", "hybrid"], default=None)
     parser.add_argument("--prefix", default=None)
     args = parser.parse_args()
 
@@ -283,15 +272,14 @@ def main() -> None:
     seed_everything(cfg["project"]["seed"])
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    backend = args.backend or cfg["detector"].get("backend", "yolo")
-    prefix = args.prefix or ("gcd_val_cascade" if args.backend is None else f"gcd_val_{backend}_cascade")
+    prefix = args.prefix or "gcd_val_unet_cascade"
 
-    metrics, _ = _evaluate_cascade(cfg, output_dir, args.samples, backend, prefix)
-    print(f"backend={backend}")
+    metrics, _ = _evaluate_cascade(cfg, output_dir, args.samples, prefix)
+    print("segmenter=unet")
     print(f"saved={_report_path(output_dir, prefix, 'bar.png')}")
     print(f"saved={_report_path(output_dir, prefix, 'overlay_samples.jpg')}")
     print(f"saved={_report_path(output_dir, prefix, 'metrics.json')}")
-    print(f"GCD detector image accuracy={metrics['detector_image_accuracy']:.4f}")
+    print(f"GCD U-Net segmentation gate accuracy={metrics['segmentation_gate_accuracy']:.4f}")
     print(f"GCD classifier accuracy given detection={metrics['classifier_accuracy_given_detection']:.4f}")
     print(f"GCD cascade accuracy={metrics['cascade_accuracy']:.4f}")
 

@@ -6,11 +6,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from cloud_chaser.data.augmentations import IMAGENET_MEAN, IMAGENET_STD
 from cloud_chaser.data.augmentations import eval_transforms
 from cloud_chaser.models.classifier import CloudClassifier
+from cloud_chaser.models.unet import build_unet
 from cloud_chaser.utils.checkpoint import load_checkpoint
 from cloud_chaser.utils.visualization import overlay_instance
 
@@ -23,7 +23,7 @@ def display_class_name(class_name: str) -> str:
 @dataclass
 class CloudPrediction:
     box: tuple[int, int, int, int]
-    detector_confidence: float
+    segmentation_confidence: float
     class_name: str
     class_confidence: float
 
@@ -31,44 +31,29 @@ class CloudPrediction:
 class CloudIdentifier:
     def __init__(
         self,
-        detector_weights: str | Path,
+        unet_weights: str | Path,
         classifier_weights: str | Path,
         class_names: list[str] | None = None,
-        detector_backend: str = "yolo",
-        unet_weights: str | Path | None = None,
         unet_threshold: float = 0.45,
         unet_min_area: int = 256,
         device: str = "cuda",
         image_size: int = 224,
-        detector_conf: float = 0.25,
-        detector_iou: float = 0.6,
         half: bool = True,
         crop_padding: int = 12,
     ) -> None:
         self.device = device if device != "cuda" or torch.cuda.is_available() else "cpu"
-        if detector_backend not in {"yolo", "hybrid", "unet"}:
-            raise ValueError(f"Unsupported detector backend: {detector_backend}")
-        self.detector = None
-        if detector_backend != "unet":
-            from ultralytics import YOLO
-
-            self.detector = YOLO(str(detector_weights))
-        self.detector_conf = detector_conf
-        self.detector_iou = detector_iou
         self.half = half and self.device != "cpu"
         self.crop_padding = crop_padding
         self.image_size = image_size
-        self.detector_backend = detector_backend
         self.unet_threshold = unet_threshold
         self.unet_min_area = unet_min_area
-        self.unet = None
-        if detector_backend in {"hybrid", "unet"} and unet_weights is not None and Path(unet_weights).exists():
-            from cloud_chaser.models.unet import CloudUNet
-
-            checkpoint = load_checkpoint(unet_weights, map_location=self.device)
-            self.unet = CloudUNet().to(self.device)
-            self.unet.load_state_dict(checkpoint["model"])
-            self.unet.eval()
+        checkpoint = load_checkpoint(unet_weights, map_location=self.device)
+        self.unet = build_unet(
+            architecture=checkpoint.get("architecture", "compact"),
+            features=checkpoint.get("features"),
+        ).to(self.device)
+        self.unet.load_state_dict(checkpoint["model"])
+        self.unet.eval()
         self.transform = eval_transforms(image_size)
 
         classifier_path = Path(classifier_weights)
@@ -108,8 +93,6 @@ class CloudIdentifier:
         return crops
 
     def _unet_instances(self, image_rgb: np.ndarray) -> tuple[torch.Tensor, torch.Tensor, list[float]]:
-        if self.unet is None:
-            return torch.empty((0, *image_rgb.shape[:2]), dtype=torch.bool), torch.empty((0, 4)), []
         h, w = image_rgb.shape[:2]
         resized = cv2.resize(image_rgb, (self.image_size, self.image_size), interpolation=cv2.INTER_AREA)
         x = resized.astype(np.float32) / 255.0
@@ -146,32 +129,7 @@ class CloudIdentifier:
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         h, w = image_rgb.shape[:2]
 
-        if self.detector_backend == "unet":
-            masks, boxes, detector_scores = self._unet_instances(image_rgb)
-        else:
-            if self.detector is None:
-                raise RuntimeError("YOLO detector is not initialized.")
-            results = self.detector.predict(
-                image_rgb,
-                conf=self.detector_conf,
-                iou=self.detector_iou,
-                retina_masks=True,
-                device=self.device,
-                half=self.half,
-                verbose=False,
-            )
-            result = results[0]
-            if result.masks is None or result.boxes is None or len(result.boxes) == 0:
-                if self.detector_backend == "hybrid":
-                    masks, boxes, detector_scores = self._unet_instances(image_rgb)
-                else:
-                    return image_bgr, []
-            else:
-                masks = result.masks.data
-                if masks.shape[-2:] != (h, w):
-                    masks = F.interpolate(masks[:, None].float(), size=(h, w), mode="nearest")[:, 0] > 0.5
-                boxes = result.boxes.xyxy.detach().cpu()
-                detector_scores = result.boxes.conf.detach().cpu().tolist()
+        masks, boxes, segmentation_scores = self._unet_instances(image_rgb)
 
         if len(boxes) == 0:
             return image_bgr, []
@@ -184,8 +142,8 @@ class CloudIdentifier:
 
         overlay = image_bgr.copy()
         predictions: list[CloudPrediction] = []
-        for i, (box_tensor, det_score, label_idx, cls_score) in enumerate(
-            zip(boxes, detector_scores, labels, confs, strict=False)
+        for i, (box_tensor, seg_score, label_idx, cls_score) in enumerate(
+            zip(boxes, segmentation_scores, labels, confs, strict=False)
         ):
             box = tuple(int(v) for v in box_tensor.tolist())
             class_name = display_class_name(self.classes[int(label_idx)])
@@ -202,7 +160,7 @@ class CloudIdentifier:
             predictions.append(
                 CloudPrediction(
                     box=box,
-                    detector_confidence=float(det_score),
+                    segmentation_confidence=float(seg_score),
                     class_name=class_name,
                     class_confidence=class_conf,
                 )

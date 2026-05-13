@@ -2,7 +2,7 @@
 
 ## Concept
 
-Cloud Chaser is a hybrid two-stage computer vision system for cloud identification in sky and outdoor imagery. The first stage detects cloud regions using a YOLO-Seg primary detector and a U-Net fallback detector. The second stage classifies the detected RGB crop into one of seven meteorological cloud categories using a CNN trained on GCD.
+Cloud Chaser is a two-stage computer vision research system for cloud identification in sky and outdoor imagery. The first stage compares six supervised U-Net variants trained on SWIMSEG/SkyImage masks. The second stage classifies RGB crops from segmented cloud components into one of seven meteorological cloud categories using a contrastive self-supervised ResNet50 classifier trained and fine-tuned on GCD.
 
 Given an image \(I\), the system predicts cloud regions:
 
@@ -10,32 +10,30 @@ Given an image \(I\), the system predicts cloud regions:
 \mathcal{P} = \{(M_i, B_i, c_i, s_i, p_i)\}_{i=1}^{N}
 \]
 
-where \(M_i\) is a cloud mask, \(B_i\) is a bounding box, \(c_i\) is the predicted cloud type, \(s_i\) is detector confidence, and \(p_i\) is classifier confidence.
+where \(M_i\) is a cloud mask, \(B_i\) is a bounding box, \(c_i\) is the predicted cloud type, \(s_i\) is the U-Net component confidence, and \(p_i\) is classifier confidence.
 
 ## Pipeline Diagram
 
 ```mermaid
 flowchart TD
-    A[Raw RGB image] --> B[YOLO11s-Seg primary detector]
-    B --> C{YOLO detections?}
-    C -- yes --> D[YOLO masks, boxes, confidences]
-    C -- no --> E[U-Net fallback detector]
-    E --> F[Cloud probability map]
-    F --> G[Threshold + connected components]
-    G --> H[Fallback masks, boxes, confidence = mean probability]
-    D --> I[Detection output]
-    H --> I
-    I --> J[Crop original RGB image by detection box]
-    J --> K[Cloud type classifier]
-    K --> L[Softmax class probabilities]
-    I --> M[Visualization]
-    L --> M
-    M --> N[Overlay masks, boxes, class labels]
-    L --> O[Cascade metrics]
-    I --> O
+    A[Raw RGB image] --> B[U-Net variant A-F]
+    B --> C[Cloud logit map]
+    C --> D[Sigmoid probability map]
+    D --> E[Threshold]
+    E --> F[Connected components]
+    F --> G[Remove small components]
+    G --> H[Masks, boxes, mean probabilities]
+    H --> I[Crop original RGB image by component box]
+    I --> J[Cloud type classifier]
+    J --> K[Softmax class probabilities]
+    H --> L[Visualization]
+    K --> L
+    L --> M[Overlay masks, boxes, class labels]
+    H --> N[Cascade metrics]
+    K --> N
 ```
 
-Important design constraint: the detector mask is not applied to classifier pixels. The mask is used for detection and visualization only. Classification receives the original RGB box crop:
+Important design constraint: the segmentation mask is not applied to classifier pixels. The mask is used for localization and visualization only. Classification receives the original RGB box crop:
 
 ```text
 classifier input = original_image[y1:y2, x1:x2]
@@ -45,9 +43,7 @@ classifier input = original_image[y1:y2, x1:x2]
 
 ### Segmentation: SWIMSEG / SkyImage
 
-SWIMSEG provides explicit binary cloud masks. The converter discovers image-mask pairs, binarizes masks, extracts connected components, converts components to YOLO polygons, and writes a one-class cloud segmentation dataset.
-
-The same binary masks are used to train the U-Net fallback detector directly as semantic segmentation.
+SWIMSEG provides explicit binary cloud masks. The local preparation step discovers image-mask pairs, binarizes masks, creates a deterministic train/validation/test split, and writes a manifest consumed by the PyTorch U-Net dataset.
 
 Configured split:
 
@@ -71,85 +67,24 @@ GCD supplies seven image-level cloud-type labels:
 7_mixed
 ```
 
-The local loader supports both `train/<class>/*.jpg` and direct `<class>/*.jpg` layouts. GCD is treated as supervised classification data, not as an unlabeled pretraining substitute.
+The local loader supports both `train/<class>/*.jpg` and direct `<class>/*.jpg` layouts.
 
 ## Network Architectures
 
-### YOLO-Seg Primary Detector
+### U-Net Segmenter Family
 
-The primary detector is an Ultralytics YOLO segmentation model:
+The research compares six U-Net segmenters:
 
-```text
-model: yolo11s-seg.pt
-task: instance segmentation
-classes: 1
-class name: cloud
-input size: 640 x 640
-```
+| ID | Name | Main Change |
+|---|---|---|
+| A | Current compact U-Net | `features=[32,64,128,256]`, transposed-conv decoder |
+| B | Medium U-Net | `features=[64,128,256,512]`, higher-capacity standard U-Net |
+| C | Dilated U-Net | replaces encoder DoubleConv blocks with dilated blocks |
+| D | Dilated + ASPP U-Net | adds ASPP to encoder blocks for multi-scale context |
+| E | Bicubic decoder U-Net | replaces transposed upsampling with bicubic interpolation |
+| F | Improved U-Net | adds DS skip path and Im-CSAM attention |
 
-YOLO-Seg architecture summary from the training logs:
-
-```text
-YOLO11s-Seg fused model
-layers: 114
-parameters: 10,067,203
-GFLOPs: 32.8
-```
-
-Functional decomposition:
-
-```text
-Input image
-  -> convolutional backbone
-  -> multi-scale feature pyramid / neck
-  -> detection head for boxes + objectness
-  -> mask prototype branch
-  -> mask coefficients per detection
-  -> instance masks and boxes
-```
-
-Training target:
-
-```text
-SWIMSEG binary masks -> connected components -> YOLO polygon labels
-```
-
-Optimization configuration:
-
-```yaml
-epochs: 120
-imgsz: 640
-batch: 8
-patience: 35
-lr0: 0.01
-weight_decay: 0.0005
-amp: true
-optimizer: Ultralytics default optimizer/scheduler
-losses: Ultralytics segmentation objective
-       box loss + classification/objectness loss + DFL + mask/segmentation loss
-```
-
-Inference settings:
-
-```yaml
-confidence threshold: 0.25
-NMS IoU threshold: 0.60
-half precision: true when CUDA is available
-```
-
-Output:
-
-```text
-M_i: instance mask
-B_i: bounding box
-s_i: detector confidence
-```
-
-### U-Net Fallback Detector
-
-The fallback detector is a compact binary U-Net trained on SWIMSEG masks. It is used when YOLO returns no cloud detections.
-
-Input/output:
+All variants predict the same binary cloud mask:
 
 ```text
 input:  3 x 224 x 224 normalized RGB image
@@ -174,14 +109,16 @@ Decoder:
   up4: ConvTranspose2d(64 -> 32)   + concat skip 32  + DoubleConv(64 -> 32)
 
 Output:
-  Conv2d(32 -> 1, kernel_size=1)
+Conv2d(32 -> 1, kernel_size=1)
 ```
 
-Model size:
+For Baseline B and Models C-F, the same topology is scaled to:
 
 ```text
-base channels: 32
-trainable parameters: 7,763,041
+features = [64, 128, 256, 512]
+bottleneck = DoubleConv(512 -> 1024)
+decoder channels = 512 -> 256 -> 128 -> 64
+output = Conv2d(64 -> 1, kernel_size=1)
 ```
 
 `DoubleConv(a -> b)` is:
@@ -195,10 +132,43 @@ BatchNorm2d(b)
 ReLU(inplace=true)
 ```
 
-Channel schedule:
+Variant-specific modules:
 
 ```text
-32 -> 64 -> 128 -> 256 -> 512 -> 256 -> 128 -> 64 -> 32 -> 1
+Baseline A compact:
+  encoder block: DoubleConv
+  decoder upsampling: ConvTranspose2d(kernel=2, stride=2)
+  skip fusion: direct concatenation
+
+Baseline B medium:
+  encoder block: DoubleConv
+  channels: [64, 128, 256, 512]
+  decoder upsampling: ConvTranspose2d(kernel=2, stride=2)
+  skip fusion: direct concatenation
+
+Model C dilated:
+  encoder block: DilatedConv(dilation=2) -> DilatedConv(dilation=2)
+  decoder upsampling: ConvTranspose2d(kernel=2, stride=2)
+  purpose: larger receptive field without extra pooling
+
+Model D dilated + ASPP:
+  encoder block: DilatedConv(dilation=2) -> ASPP -> DilatedConv(dilation=2)
+  ASPP branches: Conv3x3 dilation 1, 3, 5 plus Conv1x1
+  ASPP projection: Conv1x1(4C -> C) + BatchNorm + ReLU
+  purpose: multi-scale cloud context
+
+Model E bicubic decoder:
+  encoder block: DilatedConv -> ASPP -> DilatedConv
+  decoder upsampling: bicubic resize x2 -> Conv1x1 -> BatchNorm -> ReLU
+  purpose: cleaner upsampling than learned transposed convolution
+
+Model F full improved:
+  encoder block: DilatedConv -> ASPP -> DilatedConv
+  decoder upsampling: bicubic resize x2 -> Conv1x1 -> BatchNorm -> ReLU
+  skip path: DSResidualPath -> ImprovedCSAM
+  DSResidualPath: two depthwise-separable conv blocks with residual addition
+  Channel attention: global average/max pooling -> Conv1x1(C -> max(C/8,4)) -> ReLU -> Conv1x1 -> sigmoid
+  Spatial attention: depthwise-separable conv -> Conv1x1(C -> 1) -> sigmoid
 ```
 
 Optimization configuration:
@@ -214,7 +184,7 @@ mixed precision: true when CUDA is available
 checkpoint selection: best validation mIoU
 ```
 
-U-Net inference post-processing:
+Inference post-processing:
 
 ```text
 probability = sigmoid(logits)
@@ -225,9 +195,9 @@ box = component bounding rectangle
 confidence = mean probability inside component
 ```
 
-### Cloud-Type Classifier
+### Cloud-Type Classifier With CSSL
 
-The classifier is a CNN encoder plus a small classification head.
+The classifier follows the attached contrastive self-supervised learning paper. A ResNet50 encoder is pretrained using a MoCo-style contrastive objective and then fine-tuned with a supervised fully connected head.
 
 Default configuration:
 
@@ -237,6 +207,10 @@ num_classes: 7
 input size: 224 x 224
 dropout: 0.2
 pretraining: ImageNet
+CSSL projection dimension: 128
+CSSL queue size: 4096
+CSSL temperature: 0.5
+CSSL momentum encoder coefficient: 0.999
 ```
 
 Forward path:
@@ -260,35 +234,14 @@ Supported encoders:
 | EfficientNet-B0 | 1280 | `Dropout(0.2) -> Linear(1280, 7)` | 4.02M | `EfficientNet_B0_Weights.IMAGENET1K_V1` |
 | DenseNet121 | 1024 | `Dropout(0.2) -> Linear(1024, 7)` | 6.96M | `DenseNet121_Weights.IMAGENET1K_V1` |
 
-Default ResNet50 structure:
-
-```text
-Conv7x7 stem + max pool
-Residual stage conv2_x
-Residual stage conv3_x
-Residual stage conv4_x
-Residual stage conv5_x
-Global average pooling
-Identity replacement for original fc layer
-Dropout(0.2)
-Linear(2048 -> 7)
-```
-
-The classifier head has 14,343 trainable parameters for the default ResNet50 setup:
-
-```text
-Linear weights: 2048 x 7 = 14,336
-Linear bias:    7
-Total head:     14,343
-```
-
-Optimization configuration:
+Fine-tuning configuration:
 
 ```yaml
-epochs: 80
-batch_size: 32
-optimizer: AdamW
-learning_rate: 0.0001
+epochs: 200
+batch_size: 16
+optimizer: SGD
+learning_rate: 0.01
+momentum: 0.9
 weight_decay: 0.0001
 loss: CrossEntropyLoss
 mixed precision: true
@@ -296,25 +249,19 @@ freeze_backbone_epochs: 2
 checkpoint selection: best validation macro F1
 ```
 
-Training augmentations:
+CSSL pretraining configuration:
 
-```text
-RandomResizedCrop(224, scale=0.65-1.0, ratio=0.85-1.2)
-HorizontalFlip(p=0.50)
-VerticalFlip(p=0.15)
-RandomShadow(p=0.25)
-GaussianBlur(p=0.20)
-ColorJitter(p=0.35)
-Normalize(ImageNet mean/std)
-ToTensorV2
-```
-
-Evaluation transform:
-
-```text
-Resize(224, 224)
-Normalize(ImageNet mean/std)
-ToTensorV2
+```yaml
+optimizer: SGD
+learning_rate: 0.03
+weight_decay: 0.0001
+batch_size: 64
+epochs: 200
+loss: InfoNCE
+projection_dim: 128
+queue_size: 4096
+temperature: 0.5
+momentum: 0.999
 ```
 
 ## Training And Checkpointing
@@ -325,55 +272,30 @@ All trainable modules use checkpoint continuation:
 last.pt -> best.pt -> start from initialization/pretrained weights
 ```
 
-YOLO resumes through the Ultralytics resume path when `last.pt` exists. U-Net and classifier checkpoints store:
+U-Net, CSSL, and classifier checkpoints store:
 
 ```text
 epoch
 model state_dict
 optimizer state_dict
 validation metrics
+architecture metadata
 best metric so far
-```
-
-Checkpoint criteria:
-
-```text
-YOLO detector: Ultralytics best validation result
-U-Net:         best validation mIoU
-Classifier:   best validation macro F1
 ```
 
 ## Inference Cascade
 
-The production inference cascade is:
-
 1. Read the image with OpenCV.
-2. Run YOLO-Seg.
-3. If YOLO returns detections, keep YOLO masks and boxes.
-4. If YOLO returns no detections and `detector.backend: hybrid`, run U-Net.
-5. Convert U-Net probability maps to connected components if needed.
-6. Crop the original RGB image by the chosen detection box.
-7. Run the classifier on RGB crops.
-8. Overlay detector masks, boxes, class labels, and probabilities.
-
-The classifier input is intentionally not masked. This keeps inference aligned with GCD-style RGB image training and avoids introducing black-mask artifacts.
+2. Run U-Net segmentation.
+3. Threshold the cloud probability map.
+4. Convert connected components into masks and boxes.
+5. Crop the original RGB image by each component box.
+6. Run the classifier on RGB crops.
+7. Overlay masks, boxes, class labels, and probabilities.
 
 ## Metrics
 
-### SWIMSEG Detector Metrics
-
-YOLO-Seg is evaluated with:
-
-```text
-box precision/recall
-box mAP50
-box mAP50-95
-mask precision/recall
-mask mAP50
-mask mAP50-95
-```
-
-U-Net is evaluated with:
+### SWIMSEG U-Net Metrics
 
 ```text
 mIoU
@@ -382,8 +304,6 @@ BCE + Dice validation loss
 ```
 
 ### GCD Classification Metrics
-
-Standalone classifier evaluation reports:
 
 ```text
 Top-1 accuracy
@@ -396,20 +316,16 @@ Cross-entropy loss
 GCD has image-level labels but no masks, so final pipeline quality is measured using image-level cascade metrics:
 
 ```text
-detector image accuracy
+segmentation gate accuracy
 classifier accuracy given detection
 end-to-end cascade accuracy
 ```
 
-Detector correctness on GCD is defined as:
+Segmentation-gate correctness on GCD is defined as:
 
 ```text
-non-clearsky class -> should produce at least one cloud detection
-clearsky class     -> should produce no cloud detection
+non-clearsky class -> should produce at least one U-Net cloud component
+clearsky class     -> should produce no U-Net cloud component
 ```
 
-Classification correctness is measured only when a detection exists. End-to-end correctness requires both the detector gate and the class prediction to be correct.
-
-## Current Bottleneck
-
-Recent cascade validation showed that hybrid detection is relatively strong, while classification after detection is the bottleneck. The most important pipeline correction was removing mask-blackout from classifier inputs. Detection masks are now used only for localization and visualization, and the classifier receives normal RGB crops.
+Classification correctness is measured only when a cloud component exists.

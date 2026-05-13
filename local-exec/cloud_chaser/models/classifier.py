@@ -71,3 +71,39 @@ class CloudClassifier(nn.Module):
     def freeze_encoder(self, freeze: bool = True) -> None:
         for param in self.encoder.parameters():
             param.requires_grad = not freeze
+
+
+class ProjectionHead(nn.Module):
+    def __init__(self, in_dim: int, hidden_dim: int = 2048, out_dim: int = 128) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, out_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class ContrastiveCloudEncoder(nn.Module):
+    """ResNet-style encoder plus MLP projection head for CSSL/MoCo pretraining."""
+
+    def __init__(
+        self,
+        backbone: BackboneName = "resnet50",
+        projection_dim: int = 128,
+        pretrained: bool = True,
+    ) -> None:
+        super().__init__()
+        bundle = build_encoder(backbone, pretrained=pretrained)
+        self.backbone_name = backbone
+        self.encoder = bundle.encoder
+        self.projector = ProjectionHead(bundle.features_dim, out_dim=projection_dim)
+        self.features_dim = bundle.features_dim
+
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        return self.encoder(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.projector(self.forward_features(x))
