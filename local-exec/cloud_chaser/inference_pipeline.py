@@ -45,10 +45,14 @@ class CloudIdentifier:
         half: bool = True,
         crop_padding: int = 12,
     ) -> None:
-        from ultralytics import YOLO
-
         self.device = device if device != "cuda" or torch.cuda.is_available() else "cpu"
-        self.detector = YOLO(str(detector_weights))
+        if detector_backend not in {"yolo", "hybrid", "unet"}:
+            raise ValueError(f"Unsupported detector backend: {detector_backend}")
+        self.detector = None
+        if detector_backend != "unet":
+            from ultralytics import YOLO
+
+            self.detector = YOLO(str(detector_weights))
         self.detector_conf = detector_conf
         self.detector_iou = detector_iou
         self.half = half and self.device != "cpu"
@@ -145,6 +149,8 @@ class CloudIdentifier:
         if self.detector_backend == "unet":
             masks, boxes, detector_scores = self._unet_instances(image_rgb)
         else:
+            if self.detector is None:
+                raise RuntimeError("YOLO detector is not initialized.")
             results = self.detector.predict(
                 image_rgb,
                 conf=self.detector_conf,

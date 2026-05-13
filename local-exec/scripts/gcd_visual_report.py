@@ -29,7 +29,17 @@ def _best_image_prediction(predictions) -> tuple[str | None, float]:
     return best.class_name, best.detector_confidence * best.class_confidence
 
 
-def _evaluate_cascade(cfg: dict, output_dir: Path, samples: int) -> tuple[dict, list[dict]]:
+def _report_path(output_dir: Path, prefix: str, suffix: str) -> Path:
+    return output_dir / f"{prefix}_{suffix}"
+
+
+def _evaluate_cascade(
+    cfg: dict,
+    output_dir: Path,
+    samples: int,
+    backend: str,
+    prefix: str,
+) -> tuple[dict, list[dict]]:
     records, classes = build_gcd_records(
         cfg["data"]["gcd_root"],
         split="val",
@@ -42,7 +52,7 @@ def _evaluate_cascade(cfg: dict, output_dir: Path, samples: int) -> tuple[dict, 
         detector_weights=cfg["inference"]["detector_weights"],
         classifier_weights=cfg["inference"]["classifier_weights"],
         class_names=classes,
-        detector_backend=cfg["detector"].get("backend", "yolo"),
+        detector_backend=backend,
         unet_weights=cfg.get("unet", {}).get("checkpoint"),
         unet_threshold=cfg.get("unet", {}).get("threshold", 0.45),
         unet_min_area=cfg.get("unet", {}).get("min_area", 256),
@@ -80,7 +90,7 @@ def _evaluate_cascade(cfg: dict, output_dir: Path, samples: int) -> tuple[dict, 
         if expects_cloud:
             cascade_correct = has_detection and classification_correct
         else:
-            cascade_correct = (not has_detection) or classification_correct
+            cascade_correct = not has_detection
 
         total_by_class[true_idx] += 1
         detected_by_class[true_idx] += int(has_detection)
@@ -114,6 +124,7 @@ def _evaluate_cascade(cfg: dict, output_dir: Path, samples: int) -> tuple[dict, 
 
     metrics = {
         "split": "val",
+        "detector_backend": backend,
         "num_images": int(total_by_class.sum()),
         "classes": classes,
         "note": (
@@ -133,13 +144,13 @@ def _evaluate_cascade(cfg: dict, output_dir: Path, samples: int) -> tuple[dict, 
         "confusion_matrix_given_detection": confusion.tolist(),
         "details": details,
     }
-    (output_dir / "gcd_val_cascade_metrics.json").write_text(json.dumps(metrics, indent=2))
-    _plot_cascade_bars(metrics, output_dir)
-    overlay_path = _make_overlay_grid(cfg, output_dir, details, samples)
+    _report_path(output_dir, prefix, "metrics.json").write_text(json.dumps(metrics, indent=2))
+    _plot_cascade_bars(metrics, output_dir, prefix)
+    overlay_path = _make_overlay_grid(cfg, output_dir, details, samples, backend, prefix)
     return metrics, details if overlay_path else details
 
 
-def _plot_cascade_bars(metrics: dict, output_dir: Path) -> None:
+def _plot_cascade_bars(metrics: dict, output_dir: Path, prefix: str) -> None:
     labels = [display_class_name(name) for name in metrics["classes"]]
     total = np.array(metrics["total_by_class"])
     detection_correct = np.array(metrics["detection_correct_by_class"])
@@ -154,7 +165,7 @@ def _plot_cascade_bars(metrics: dict, output_dir: Path) -> None:
     b2 = ax.bar(x, classified_correct, width, color="#2a9d8f", label="Classified correct after detection")
     b3 = ax.bar(x + width, cascade_correct, width, color="#e76f51", label="End-to-end correct")
     ax.set_title(
-        "GCD validation cascade: cloud detection -> cloud type classification\n"
+        f"GCD validation cascade ({metrics['detector_backend']}): cloud detection -> cloud type classification\n"
         f"det={metrics['detector_image_accuracy']:.1%}, "
         f"cls|det={metrics['classifier_accuracy_given_detection']:.1%}, "
         f"end-to-end={metrics['cascade_accuracy']:.1%}"
@@ -178,7 +189,7 @@ def _plot_cascade_bars(metrics: dict, output_dir: Path) -> None:
                 rotation=90,
             )
     fig.tight_layout()
-    fig.savefig(output_dir / "gcd_val_cascade_bar.png", dpi=180)
+    fig.savefig(_report_path(output_dir, prefix, "bar.png"), dpi=180)
     plt.close(fig)
 
 
@@ -201,7 +212,14 @@ def _select_samples(details: list[dict], samples: int, seed: int) -> list[dict]:
     return selected[:samples]
 
 
-def _make_overlay_grid(cfg: dict, output_dir: Path, details: list[dict], samples: int) -> Path | None:
+def _make_overlay_grid(
+    cfg: dict,
+    output_dir: Path,
+    details: list[dict],
+    samples: int,
+    backend: str,
+    prefix: str,
+) -> Path | None:
     selected = _select_samples(details, samples, cfg["project"]["seed"])
     if not selected:
         return None
@@ -211,7 +229,7 @@ def _make_overlay_grid(cfg: dict, output_dir: Path, details: list[dict], samples
         detector_weights=cfg["inference"]["detector_weights"],
         classifier_weights=cfg["inference"]["classifier_weights"],
         class_names=classes,
-        detector_backend=cfg["detector"].get("backend", "yolo"),
+        detector_backend=backend,
         unet_weights=cfg.get("unet", {}).get("checkpoint"),
         unet_threshold=cfg.get("unet", {}).get("threshold", 0.45),
         unet_min_area=cfg.get("unet", {}).get("min_area", 256),
@@ -246,7 +264,7 @@ def _make_overlay_grid(cfg: dict, output_dir: Path, details: list[dict], samples
         ax.imshow(image)
         ax.set_title(title, fontsize=10)
     fig.tight_layout()
-    output_path = output_dir / "gcd_val_cascade_overlay_samples.jpg"
+    output_path = _report_path(output_dir, prefix, "overlay_samples.jpg")
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
     return output_path
@@ -257,17 +275,22 @@ def main() -> None:
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--output-dir", default="reports")
     parser.add_argument("--samples", type=int, default=9)
+    parser.add_argument("--backend", choices=["yolo", "unet", "hybrid"], default=None)
+    parser.add_argument("--prefix", default=None)
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     seed_everything(cfg["project"]["seed"])
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    backend = args.backend or cfg["detector"].get("backend", "yolo")
+    prefix = args.prefix or ("gcd_val_cascade" if args.backend is None else f"gcd_val_{backend}_cascade")
 
-    metrics, _ = _evaluate_cascade(cfg, output_dir, args.samples)
-    print(f"saved={output_dir / 'gcd_val_cascade_bar.png'}")
-    print(f"saved={output_dir / 'gcd_val_cascade_overlay_samples.jpg'}")
-    print(f"saved={output_dir / 'gcd_val_cascade_metrics.json'}")
+    metrics, _ = _evaluate_cascade(cfg, output_dir, args.samples, backend, prefix)
+    print(f"backend={backend}")
+    print(f"saved={_report_path(output_dir, prefix, 'bar.png')}")
+    print(f"saved={_report_path(output_dir, prefix, 'overlay_samples.jpg')}")
+    print(f"saved={_report_path(output_dir, prefix, 'metrics.json')}")
     print(f"GCD detector image accuracy={metrics['detector_image_accuracy']:.4f}")
     print(f"GCD classifier accuracy given detection={metrics['classifier_accuracy_given_detection']:.4f}")
     print(f"GCD cascade accuracy={metrics['cascade_accuracy']:.4f}")
